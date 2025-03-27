@@ -1,0 +1,6 @@
+__pycache__
+bash
+bashlogs
+checkpoints*
+test.py
+log*
