@@ -87,7 +87,7 @@ if __name__ == "__main__":
     env = VecMonitor(env)
 
     model = MaskablePPO(
-        learning_rate = 5e-5,
+        learning_rate = 1e-4,
         policy=MaskableActorCriticPolicy,
         env=env,
         verbose=1,
@@ -109,7 +109,7 @@ if __name__ == "__main__":
         eval_env_fn=make_eval_env,
         eval_episodes=1_000,
         eval_freq=25_000,
-        save_path="checkpoints/best_model",
+        save_path="checkpoints2/best_model",
         num_eval_envs=4
     )
 
