@@ -1,7 +1,6 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-import random
 from numpy.lib.stride_tricks import sliding_window_view
 
 class BingoEnv(gym.Env):
@@ -28,7 +27,12 @@ class BingoEnv(gym.Env):
                       [1],
                       [1],
                       [1]]),
+            np.array([[1, 1, 1],
+                      [1, 1, 1],
+                      [1, 1, 1]]),
         ]
+        self.pattern_prob = np.array([0.32, 0.32, 0.15, 0.15, 0.06])
+        self.pattern_prob /= np.sum(self.pattern_prob)
         for i, pattern in enumerate(self.flip_patterns):
             ph, pw = pattern.shape
             assert ph % 2 == 1 and pw % 2 == 1, \
@@ -40,7 +44,7 @@ class BingoEnv(gym.Env):
             padded[offset_h:offset_h+ph, offset_w:offset_w+pw] = pattern
             self.flip_patterns[i] = padded
 
-        self.pattern_costs = [5.0, 5.0, 7.0, 7.0]
+        self.pattern_costs = [200., 200., 200., 200., 200.]
         self.max_cost = max(self.pattern_costs)
 
         self.action_space = spaces.Discrete(self.board_size * self.board_size)
@@ -66,20 +70,12 @@ class BingoEnv(gym.Env):
     def step(self, action):
         row, col = divmod(action, self.board_size)
 
-        # pre_remaining = np.count_nonzero(self.board == 0)
         self._apply_pattern(row, col)
-        # post_remaining = np.count_nonzero(self.board == 0)
-        # delta = (pre_remaining - post_remaining) / (self.board_size **2)
-        # assert delta > 0.
-        # reward = delta - self.current_cost / self.max_cost
         reward = - self.current_cost / self.max_cost
         self.current_step += 1
 
         terminated = self.board.sum() == self.board_size * self.board_size
         truncated = self.current_step >= self.max_steps
-
-        if terminated:
-            reward += 1.0
 
         self._choose_new_pattern()
         obs = self._get_obs()
@@ -88,7 +84,7 @@ class BingoEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def _choose_new_pattern(self):
-        idx = random.randint(0, len(self.flip_patterns) - 1)
+        idx = int(np.random.choice(len(self.flip_patterns), 1, p=self.pattern_prob)[0])
         self.current_pattern = self.flip_patterns[idx]
         self.current_cost = self.pattern_costs[idx]
 
@@ -110,7 +106,6 @@ class BingoEnv(gym.Env):
         board_region = self.board[r_start:r_end, c_start:c_end]
         pattern_region = self.current_pattern[pattern_r_start:pattern_r_end, pattern_c_start:pattern_c_end]
 
-        # 색칠 (0 -> 1)
         self.board[r_start:r_end, c_start:c_end] = np.maximum(board_region, pattern_region)
 
 
@@ -161,22 +156,6 @@ if __name__ == "__main__":
     env = BingoEnv(7)
     obs, _ = env.reset()
     env.render()
-
-    # print("=== 초기 보드 상태 ===")
-    # print(env.board)
-
-    # print("\n=== 현재 플립 패턴 ===")
-    # print(env.current_pattern)
-
-    # mask = env.get_valid_action_mask()
-    # print("\n=== 유효한 액션 마스크 ===")
-    # print(mask.reshape(env.board_size, env.board_size))  # 2D로 보기 좋게 출력
-
-    # print("\n=== 유효한 액션 인덱스 ===")
-    # valid_indices = np.where(mask == 1)[0]
-    # print(valid_indices)
-
-    # print(f"\n총 유효한 액션 수: {len(valid_indices)} / {env.board_size ** 2}")
 
     for _ in range(3):
         env.step(np.random.randint(env.board_size**2))

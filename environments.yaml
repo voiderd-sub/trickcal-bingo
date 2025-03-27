@@ -3,7 +3,6 @@ channels:
   - conda-forge
 dependencies:
   - pytorch::pytorch
-  - pytorch-cuda=12.4
   - stable-baselines3
   - gymnasium
   - pyside6

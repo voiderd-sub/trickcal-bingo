@@ -4,3 +4,5 @@ bashlogs
 checkpoints*
 test.py
 log*
+
+bingo_log.json

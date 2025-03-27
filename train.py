@@ -11,43 +11,30 @@ import os
 
 
 def evaluate_policy_parallel(model, eval_env_fn, num_envs=4, num_episodes=1000):
-    # 벡터화된 평가 환경 생성 (여기서는 DummyVecEnv 사용)
     eval_env = SubprocVecEnv([eval_env_fn for _ in range(num_envs)])
     eval_env = VecMonitor(eval_env)
     
-    episode_counts = []  # 각 에피소드의 액션 횟수를 저장할 리스트
-
-    # 각 환경의 현재 에피소드에서 사용한 액션 수를 저장할 배열
-    # 초기에는 모두 0
+    episode_counts = []
     actions_counts = np.zeros(num_envs, dtype=np.int32)
 
-    # 각 환경의 에피소드 종료 여부
     dones = [False] * num_envs
-    # 전체 에피소드 집계
     episodes_finished = 0
 
-    # 환경 초기화
     obs = eval_env.reset()
     action_masks = obs["action_mask"]
     
     while episodes_finished < num_episodes:
-        # 모델로부터 행동 예측 (병렬적으로 모든 환경에서 실행)
         actions, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
         obs, rewards, dones, infos = eval_env.step(actions)
         action_masks = obs["action_mask"]
         
-        # 각 환경마다 액션 횟수를 증가
         actions_counts += 1
-        
-        # 종료된 환경 처리: dones는 벡터 형태
+
         for i, done in enumerate(dones):
             if done:
-                # 종료된 환경의 액션 횟수를 기록하고 리셋
                 episode_counts.append(actions_counts[i])
-                actions_counts[i] = 0  # 해당 환경의 액션 수 초기화
+                actions_counts[i] = 0
                 episodes_finished += 1
-                # 필요시 각 환경을 개별 리셋할 수도 있음
-                # DummyVecEnv는 자동으로 리셋하므로 별도 처리 필요 없음
 
     eval_env.close()
     mean_actions = np.mean(episode_counts)

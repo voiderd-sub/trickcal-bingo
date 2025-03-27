@@ -50,30 +50,3 @@ class BingoCNNExtractor(BaseFeaturesExtractor):
         cost_feat = self.cost_fc(cost)
         combined = torch.cat([cnn_out, cost_feat], dim=1)
         return self.linear(combined)
-
-
-# class BingoCNNPolicy(ActorCriticPolicy):
-#     def __init__(
-#         self,
-#         observation_space,
-#         action_space,
-#         lr_schedule,
-#         cnn_channels=[32, 64],
-#         kernel_size=3,
-#         cost_embed_dim=16,
-#         features_dim=128,
-#         **kwargs
-#     ):
-#         super().__init__(
-#             observation_space,
-#             action_space,
-#             lr_schedule,
-#             features_extractor_class=BingoCNNExtractor,
-#             features_extractor_kwargs=dict(
-#                 features_dim=features_dim,
-#                 cnn_channels=cnn_channels,
-#                 kernel_size=kernel_size,
-#                 cost_embed_dim=cost_embed_dim
-#             ),
-#             **kwargs
-#         )
