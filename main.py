@@ -6,7 +6,8 @@ import numpy as np
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QListWidget, QListWidgetItem,
-    QPushButton, QMessageBox, QHeaderView, QAbstractItemView
+    QPushButton, QMessageBox, QHeaderView, QAbstractItemView, QLabel,
+    QGroupBox
 )
 from PySide6.QtGui import QColor, QBrush, QPixmap, QPainter
 from PySide6.QtCore import Qt, QSize
@@ -22,6 +23,7 @@ def trim_pattern(pattern):
     min_row, min_col = indices.min(axis=0)
     max_row, max_col = indices.max(axis=0)
     return pattern[min_row:max_row + 1, min_col:max_col + 1]
+
 
 def pad_to_min_size(pattern):
     h, w = pattern.shape
@@ -98,7 +100,6 @@ class BoardTableWidget(QTableWidget):
                 self.setItem(i, j, item)
 
     def updateBoard(self, board, preview_info=None):
-        # board: numpy array (board_size x board_size), 0은 미색(white), 1은 영구 칠한 상태(gray)
         for i in range(self.board_size):
             for j in range(self.board_size):
                 item = self.item(i, j)
@@ -108,10 +109,9 @@ class BoardTableWidget(QTableWidget):
                     item.setBackground(QColor("white"))
 
         if preview_info is not None:
-            agent_action = preview_info["agent_action"]  # (row, col)
+            agent_action = preview_info["agent_action"]
             a_row, a_col = agent_action
 
-            # preview coloring
             pattern = preview_info["pattern"]
             new_board = apply_pattern_to_board(board, pattern, a_row, a_col)
             diff = new_board - board
@@ -119,14 +119,13 @@ class BoardTableWidget(QTableWidget):
                 for j in range(self.board_size):
                     if diff[i, j] == 1:
                         self.item(i, j).setBackground(QColor("lightblue"))
-            # center
             self.item(a_row, a_col).setBackground(QColor("blue"))
 
-# --- 패턴 시각화를 위한 리스트 위젯 ---
+
 class PatternListWidget(QListWidget):
     def __init__(self, flip_patterns, parent=None):
         super().__init__(parent)
-        self.flip_patterns = flip_patterns  # env.flip_patterns (패딩된 상태)
+        self.flip_patterns = flip_patterns
         self.parent_gui = None
         self.initUI()
 
@@ -141,7 +140,6 @@ class PatternListWidget(QListWidget):
             icon = self.createPatternIcon(trimmed)
             item = QListWidgetItem()
             item.setIcon(icon)
-
             item.setData(Qt.UserRole, idx)
             self.addItem(item)
 
@@ -175,22 +173,61 @@ class PatternListWidget(QListWidget):
         else:
             super().mousePressEvent(event)
 
+
+class StoredPatternWidget(QWidget):
+    """저장된 패턴 표시 위젯"""
+    def __init__(self, board_size, parent=None):
+        super().__init__(parent)
+        self.board_size = board_size
+        self.cell_size = 15
+        self.stored_pattern = None
+        self.setFixedSize(board_size * self.cell_size + 4, board_size * self.cell_size + 4)
+    
+    def setStoredPattern(self, pattern):
+        self.stored_pattern = pattern
+        self.update()
+    
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("white"))
+        
+        if self.stored_pattern is not None:
+            for i in range(self.board_size):
+                for j in range(self.board_size):
+                    x = j * self.cell_size + 2
+                    y = i * self.cell_size + 2
+                    if self.stored_pattern[i, j] == 1:
+                        painter.fillRect(x, y, self.cell_size-1, self.cell_size-1, QColor("darkgreen"))
+                    else:
+                        painter.setPen(QColor("lightgray"))
+                        painter.drawRect(x, y, self.cell_size-1, self.cell_size-1)
+        else:
+            painter.setPen(QColor("gray"))
+            painter.drawText(self.rect(), Qt.AlignCenter, "없음")
+        
+        painter.end()
+
+
 class BingoGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Trickcal Bingo")
-        self.resize(600, 600)
+        self.resize(700, 650)
 
         self.env = BingoEnv(board_size=7)
         self.env._choose_new_pattern = lambda: None
 
-        self.model = MaskablePPO.load("model/best_model.zip")
+        try:
+            self.model = MaskablePPO.load("model/best_model.zip")
+        except:
+            self.model = None
+            print("Warning: Model not found. Agent recommendations disabled.")
 
         self.board_size = self.env.board_size
         self.board = self.env.board.copy()
-        self.history = []      # board history for undo
-        self.action_log = []   # (pattern_idx, agent_action)
-        self.preview_info = None  # {"pattern_idx", "agent_action", "pattern"}
+        self.history = []
+        self.action_log = []
+        self.preview_info = None
         self.last_selected_item = None
 
         self.initUI()
@@ -211,15 +248,15 @@ class BingoGUI(QMainWindow):
 
         self.pattern_list = PatternListWidget(self.env.flip_patterns)
         self.pattern_list.parent_gui = self
-        # self.pattern_list.currentItemChanged.connect(self.on_pattern_selected)
         self.pattern_list.itemClicked.connect(self.on_pattern_clicked)
         left_layout.addWidget(self.pattern_list)
 
-        # 우측: 이전, 다음, 초기화 버튼 (초기화는 항상 활성)
+        # 우측: 버튼 및 상태 표시
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         main_layout.addWidget(right_widget, stretch=1)
 
+        # 이전/다음/초기화 버튼
         self.prev_button = QPushButton("이전")
         self.prev_button.clicked.connect(self.on_prev)
         right_layout.addWidget(self.prev_button)
@@ -230,33 +267,35 @@ class BingoGUI(QMainWindow):
 
         self.reset_button = QPushButton("초기화")
         self.reset_button.clicked.connect(self.on_reset)
-        self.reset_button.setEnabled(True)
         right_layout.addWidget(self.reset_button)
+
+        right_layout.addSpacing(20)
+
+        # 보관 섹션
+        store_group = QGroupBox("패턴 보관")
+        store_layout = QVBoxLayout(store_group)
+        
+        self.store_button = QPushButton("현재 패턴 보관")
+        self.store_button.clicked.connect(self.on_store)
+        store_layout.addWidget(self.store_button)
+        
+        self.store_remaining_label = QLabel("남은 보관 횟수: 2")
+        store_layout.addWidget(self.store_remaining_label)
+        
+        store_layout.addWidget(QLabel("저장된 패턴:"))
+        self.stored_pattern_widget = StoredPatternWidget(self.board_size)
+        store_layout.addWidget(self.stored_pattern_widget)
+        
+        right_layout.addWidget(store_group)
+
+        # 턴 정보
+        self.turn_label = QLabel("턴: 0")
+        right_layout.addWidget(self.turn_label)
 
         right_layout.addStretch()
 
         self.update_board_display()
-
-    def on_pattern_selected(self, current, previous):
-        if current is None:
-            return
-        pattern_idx = current.data(Qt.UserRole)
-        # 유저 선택에 따라 환경의 current_pattern 및 current_cost 갱신
-        self.env.current_pattern = self.env.flip_patterns[pattern_idx]
-        self.env.current_cost = self.env.pattern_costs[pattern_idx]
-
-        # 환경 관측(observation) 생성
-        obs = self.env._get_obs()
-        # 모델 예측: action_masks는 obs에 포함되어 있음
-        action, _ = self.model.predict(obs, deterministic=True, action_masks=obs["action_mask"])
-        agent_action = divmod(action, self.board_size)  # (row, col)
-
-        self.preview_info = {
-            "pattern_idx": pattern_idx,
-            "agent_action": agent_action,
-            "pattern": self.env.current_pattern
-        }
-        self.update_board_display()
+        self.update_store_ui()
 
     def on_pattern_clicked(self, item):
         if item == self.last_selected_item:
@@ -273,9 +312,35 @@ class BingoGUI(QMainWindow):
         self.env.current_pattern = self.env.flip_patterns[pattern_idx]
         self.env.current_cost = self.env.pattern_costs[pattern_idx]
 
-        obs = self.env._get_obs()
-        action, _ = self.model.predict(obs, deterministic=True, action_masks=obs["action_mask"])
-        agent_action = divmod(int(action), self.board_size)
+        if self.model:
+            obs = self.env._get_obs()
+            action, _ = self.model.predict(obs, deterministic=True, action_masks=obs["action_mask"])
+            action = int(action)
+            
+            # 보관 액션인 경우 처리
+            if action == self.env.store_action:
+                # 보관을 추천하는 경우 - 위치 액션 중 best 선택
+                mask = obs["action_mask"][:-1]
+                valid_positions = np.where(mask == 1)[0]
+                if len(valid_positions) > 0:
+                    action = valid_positions[0]  # 첫 번째 유효 위치
+                else:
+                    self.preview_info = None
+                    self.update_board_display()
+                    return
+            
+            agent_action = divmod(action, self.board_size)
+        else:
+            # 모델 없으면 첫 유효 위치
+            mask = obs["action_mask"][:-1]
+            valid_positions = np.where(mask == 1)[0]
+            if len(valid_positions) > 0:
+                action = valid_positions[0]
+                agent_action = divmod(action, self.board_size)
+            else:
+                self.preview_info = None
+                self.update_board_display()
+                return
 
         self.preview_info = {
             "pattern_idx": pattern_idx,
@@ -288,29 +353,78 @@ class BingoGUI(QMainWindow):
         if self.preview_info is None:
             return
 
-        self.history.append(self.board.copy())
+        self.history.append({
+            "board": self.board.copy(),
+            "stored_pattern": self.env.stored_pattern.copy() if self.env.stored_pattern is not None else None,
+            "stored_pattern_idx": self.env.stored_pattern_idx,
+            "store_remaining": self.env.store_remaining,
+            "is_first_turn": self.env.is_first_turn
+        })
         self.action_log.append({
+            "action_type": "place",
             "pattern_idx": self.preview_info["pattern_idx"],
             "agent_action": self.preview_info["agent_action"]
         })
 
-        # 에이전트 액션 적용: env.step() 호출 (env.step()에서는 _choose_new_pattern()를 호출하지 않으므로 user가 지정한 패턴이 그대로 사용됨)
         row, col = self.preview_info["agent_action"]
         action = row * self.board_size + col
         obs, reward, terminated, truncated, info = self.env.step(action)
         self.board = self.env.board.copy()
         self.preview_info = None
         self.update_board_display()
+        self.update_store_ui()
         self.pattern_list.clearSelection()
         self.last_selected_item = None
 
     def on_prev(self):
         if not self.history:
             return
-        self.board = self.history.pop()
+        
+        state = self.history.pop()
+        self.board = state["board"]
+        self.env.board = self.board.copy()
+        self.env.stored_pattern = state["stored_pattern"]
+        self.env.stored_pattern_idx = state["stored_pattern_idx"]
+        self.env.store_remaining = state["store_remaining"]
+        self.env.is_first_turn = state["is_first_turn"]
+        
         if self.action_log:
             self.action_log.pop()
-        self.env.board = self.board.copy()
+        
+        self.preview_info = None
+        self.update_board_display()
+        self.update_store_ui()
+
+    def on_store(self):
+        """패턴 보관 버튼 클릭"""
+        if self.last_selected_item is None:
+            QMessageBox.information(self, "알림", "먼저 패턴을 선택하세요.")
+            return
+        
+        if not self.env._can_store():
+            QMessageBox.warning(self, "경고", "보관할 수 없습니다.")
+            return
+        
+        # 히스토리 저장
+        self.history.append({
+            "board": self.board.copy(),
+            "stored_pattern": self.env.stored_pattern.copy() if self.env.stored_pattern is not None else None,
+            "stored_pattern_idx": self.env.stored_pattern_idx,
+            "store_remaining": self.env.store_remaining,
+            "is_first_turn": self.env.is_first_turn
+        })
+        self.action_log.append({
+            "action_type": "store",
+            "pattern_idx": self.env.current_pattern_idx
+        })
+        
+        # 보관 실행
+        self.env._do_store()
+        self.update_store_ui()
+        
+        # 선택 초기화 및 UI 업데이트
+        self.pattern_list.clearSelection()
+        self.last_selected_item = None
         self.preview_info = None
         self.update_board_display()
 
@@ -320,20 +434,27 @@ class BingoGUI(QMainWindow):
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
-            self.env.board = np.zeros((self.board_size, self.board_size), dtype=np.int8)
+            self.env.reset()
+            self.env._choose_new_pattern = lambda: None
             self.board = self.env.board.copy()
             self.history = []
             self.action_log = []
             self.preview_info = None
             self.update_board_display()
+            self.update_store_ui()
             if os.path.exists("bingo_log.json"):
                 os.remove("bingo_log.json")
 
     def update_board_display(self):
         self.board_widget.updateBoard(self.board, self.preview_info)
+        self.turn_label.setText(f"턴: {self.env.current_step}")
+
+    def update_store_ui(self):
+        self.store_remaining_label.setText(f"남은 보관 횟수: {self.env.store_remaining}")
+        self.stored_pattern_widget.setStoredPattern(self.env.stored_pattern)
+        self.store_button.setEnabled(self.env._can_store() and self.last_selected_item is not None)
 
     def closeEvent(self, event):
-        # save log
         log_data = {"action_log": self.action_log}
 
         with open("bingo_log.json", "w", encoding="utf-8") as f:
@@ -344,20 +465,40 @@ class BingoGUI(QMainWindow):
         if os.path.exists("bingo_log.json"):
             with open("bingo_log.json", "r", encoding="utf-8") as f:
                 log_data = json.load(f)
-            self.env.board = np.zeros((self.board_size, self.board_size), dtype=np.int8)
+            
+            self.env.reset()
+            self.env._choose_new_pattern = lambda: None
             self.history = []
             self.action_log = []
+            
             for record in log_data.get("action_log", []):
-                pattern_idx = record["pattern_idx"]
-                agent_action = record["agent_action"]
-                self.history.append(self.env.board.copy())
+                # 히스토리 저장
+                self.history.append({
+                    "board": self.env.board.copy(),
+                    "stored_pattern": self.env.stored_pattern.copy() if self.env.stored_pattern is not None else None,
+                    "stored_pattern_idx": self.env.stored_pattern_idx,
+                    "store_remaining": self.env.store_remaining,
+                    "is_first_turn": self.env.is_first_turn
+                })
                 self.action_log.append(record)
-                self.env.current_pattern = self.env.flip_patterns[pattern_idx]
-                self.env.current_cost = self.env.pattern_costs[pattern_idx]
-                action = agent_action[0] * self.board_size + agent_action[1]
-                self.env.step(action)
+                
+                if record.get("action_type") == "store":
+                    pattern_idx = record["pattern_idx"]
+                    self.env.current_pattern = self.env.flip_patterns[pattern_idx]
+                    self.env.current_pattern_idx = pattern_idx
+                    self.env._do_store()
+                else:
+                    pattern_idx = record["pattern_idx"]
+                    agent_action = record["agent_action"]
+                    self.env.current_pattern = self.env.flip_patterns[pattern_idx]
+                    self.env.current_cost = self.env.pattern_costs[pattern_idx]
+                    action = agent_action[0] * self.board_size + agent_action[1]
+                    self.env.step(action)
+            
             self.board = self.env.board.copy()
             self.update_board_display()
+            self.update_store_ui()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

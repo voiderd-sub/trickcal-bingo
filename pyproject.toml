@@ -1,0 +1,21 @@
+[project]
+name = "trickcal-bingo"
+version = "0.1.0"
+description = "RL agent for 7x7 bingo board optimization"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "stable-baselines3",
+    "sb3-contrib",
+    "gymnasium",
+    "numpy",
+    "pyside6",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }

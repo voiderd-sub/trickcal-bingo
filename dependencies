@@ -1,4 +1,0 @@
-#!/bin/bash
-
-conda env create -f environments.yaml
-pip install sb3_contrib

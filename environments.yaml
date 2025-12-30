@@ -1,8 +1,0 @@
-name: bingo
-channels:
-  - conda-forge
-dependencies:
-  - pytorch::pytorch
-  - stable-baselines3
-  - gymnasium
-  - pyside6
