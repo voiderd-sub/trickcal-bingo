@@ -5,6 +5,8 @@ checkpoints*
 test.py
 log*
 
-bingo_log.json
+bingo_save.json
 wandb
 runs
+build/
+dist/

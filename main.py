@@ -1,206 +1,852 @@
+"""
+Bingo AI Assistant GUI.
+
+Uses trained RL models to suggest optimal pattern placements.
+Supports both store-allowed and no-store models.
+Displays D4 symmetry-averaged probabilities with center-only visualization.
+"""
+
 import sys
 import os
 import json
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import yaml
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QListWidget, QListWidgetItem,
     QPushButton, QMessageBox, QHeaderView, QAbstractItemView, QLabel,
-    QGroupBox
+    QGroupBox, QFrame
 )
-from PySide6.QtGui import QColor, QBrush, QPixmap, QPainter
+from PySide6.QtGui import QColor, QBrush, QPixmap, QPainter, QFont
 from PySide6.QtCore import Qt, QSize
 
-from bingo_env import BingoEnv
-from sb3_contrib import MaskablePPO
+# Import policy network components
+from bingo_policy import BingoCNNExtractor
 
 
-def trim_pattern(pattern):
-    indices = np.argwhere(pattern == 1)
-    if len(indices) == 0:
-        return np.array([[0]])
-    min_row, min_col = indices.min(axis=0)
-    max_row, max_col = indices.max(axis=0)
-    return pattern[min_row:max_row + 1, min_col:max_col + 1]
+# =============================================================================
+# Pattern Definitions (same as BingoEnvGPU)
+# =============================================================================
+
+PATTERNS = [
+    np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.int8),  # Plus
+    np.array([[1, 0, 1], [0, 1, 0], [1, 0, 1]], dtype=np.int8),  # X
+    np.array([[1, 1, 1], [1, 1, 1], [1, 1, 1]], dtype=np.int8),  # 3x3
+    np.array([[1, 1, 1, 1, 1, 1, 1]], dtype=np.int8),            # Horizontal
+    np.array([[1], [1], [1], [1], [1], [1], [1]], dtype=np.int8), # Vertical
+]
+
+PATTERN_NAMES = ["십자(+)", "X자", "3×3", "가로줄", "세로줄"]
 
 
-def pad_to_min_size(pattern):
-    h, w = pattern.shape
-    pad_size = max(h, w)
-    pad_h = max(pad_size - h, 0)
-    pad_w = max(pad_size - w, 0)
+# =============================================================================
+# D4 Symmetry Transformations (CPU version)
+# =============================================================================
 
-    pad_top = pad_h // 2
-    pad_bottom = pad_h - pad_top
-    pad_left = pad_w // 2
-    pad_right = pad_w - pad_left
+def create_d4_tables():
+    """Create D4 symmetry transformation lookup tables."""
+    d4_forward_pos = np.zeros((8, 49), dtype=np.int64)
+    d4_inverse_pos = np.zeros((8, 49), dtype=np.int64)
+    d4_inverse_idx = np.array([0, 3, 2, 1, 4, 7, 6, 5], dtype=np.int64)
+    
+    n = 6  # board_size - 1
+    
+    for pos in range(49):
+        row, col = pos // 7, pos % 7
+        
+        # Transform 0: identity
+        d4_forward_pos[0, pos] = pos
+        # Transform 1: rot90 CCW
+        new_row, new_col = col, n - row
+        d4_forward_pos[1, pos] = new_row * 7 + new_col
+        # Transform 2: rot180
+        new_row, new_col = n - row, n - col
+        d4_forward_pos[2, pos] = new_row * 7 + new_col
+        # Transform 3: rot270 CCW
+        new_row, new_col = n - col, row
+        d4_forward_pos[3, pos] = new_row * 7 + new_col
+        # Transform 4: flip horizontal
+        new_row, new_col = row, n - col
+        d4_forward_pos[4, pos] = new_row * 7 + new_col
+        # Transform 5: flip + rot90
+        new_row, new_col = col, row
+        d4_forward_pos[5, pos] = new_row * 7 + new_col
+        # Transform 6: flip + rot180
+        new_row, new_col = n - row, col
+        d4_forward_pos[6, pos] = new_row * 7 + new_col
+        # Transform 7: flip + rot270
+        new_row, new_col = n - col, n - row
+        d4_forward_pos[7, pos] = new_row * 7 + new_col
+    
+    # Compute inverse tables
+    for t in range(8):
+        inv_t = d4_inverse_idx[t]
+        d4_inverse_pos[t] = d4_forward_pos[inv_t]
+    
+    return d4_forward_pos, d4_inverse_pos
 
-    padded = np.pad(pattern, ((pad_top, pad_bottom), (pad_left, pad_right)), constant_values=0)
-    return padded
+
+D4_FORWARD_POS, D4_INVERSE_POS = create_d4_tables()
 
 
-def apply_pattern_to_board(board, pattern, center_row, center_col):
-    """BingoEnv._apply_pattern과 동일한 로직으로 board에 패턴 적용 결과를 반환."""
-    new_board = board.copy()
-    p_h, p_w = pattern.shape
-    offset_h = p_h // 2
-    offset_w = p_w // 2
-
-    r_start = max(center_row - offset_h, 0)
-    r_end = min(center_row + offset_h + 1, board.shape[0])
-    c_start = max(center_col - offset_w, 0)
-    c_end = min(center_col + offset_w + 1, board.shape[1])
-
-    pattern_r_start = r_start - (center_row - offset_h)
-    pattern_r_end = p_h - ((center_row + offset_h + 1) - r_end)
-    pattern_c_start = c_start - (center_col - offset_w)
-    pattern_c_end = p_w - ((center_col + offset_w + 1) - c_end)
-
-    board_region = new_board[r_start:r_end, c_start:c_end]
-    pattern_region = pattern[pattern_r_start:pattern_r_end, pattern_c_start:pattern_c_end]
-    new_board[r_start:r_end, c_start:c_end] = np.maximum(board_region, pattern_region)
-    return new_board
+def transform_board(board: np.ndarray, transform_idx: int) -> np.ndarray:
+    """Apply D4 transform to a 7x7 board."""
+    flat = board.flatten()
+    inverse_mapping = D4_INVERSE_POS[transform_idx]
+    transformed = flat[inverse_mapping]
+    return transformed.reshape(7, 7)
 
 
-class BoardTableWidget(QTableWidget):
-    def __init__(self, board_size, parent=None):
-        super().__init__(board_size, board_size, parent)
-        self.board_size = board_size
-        self.cell_size = 50
-        self.initUI()
+def inverse_transform_probs(probs: np.ndarray, transform_idx: int) -> np.ndarray:
+    """Inverse transform position probabilities back to original coordinate system."""
+    # probs: (50,) - 49 positions + 1 store action
+    pos_probs = probs[:49]
+    store_prob = probs[49]
+    
+    # inverse_mapping[new_pos] = original_pos
+    # We want: original_probs[original_pos] = transformed_probs[new_pos]
+    # So: original_probs = transformed_probs[forward_mapping]
+    forward_mapping = D4_FORWARD_POS[transform_idx]
+    original_pos_probs = pos_probs[forward_mapping]
+    
+    return np.concatenate([original_pos_probs, [store_prob]])
 
-    def initUI(self):
+
+def compute_dynamic_orbits(board: np.ndarray, pattern_idx: int = None) -> list:
+    """
+    Compute D4 symmetry orbits considering the current board state and pattern.
+    
+    Two positions P1 and P2 are in the same orbit if:
+    - Placing the pattern at P1 gives result R1
+    - Placing the pattern at P2 gives result R2
+    - There exists a D4 transform T such that T(R1) == R2
+    
+    This means the resulting boards after placement are D4-equivalent.
+    
+    Args:
+        board: Current 7x7 board state
+        pattern_idx: Index of the pattern being placed (optional, for pattern-specific orbits)
+    
+    Returns:
+        List of sets, where each set contains positions that are equivalent.
+    """
+    def board_hash(board_arr):
+        return tuple(board_arr.flatten().tolist())
+    
+    def get_canonical_hash(board_arr):
+        """Get the minimum hash over all 8 D4 transforms (canonical form)."""
+        hashes = []
+        for t in range(8):
+            transformed = transform_board(board_arr, t)
+            hashes.append(board_hash(transformed))
+        return min(hashes)
+    
+    # If no pattern specified, use simple transform-based orbits
+    if pattern_idx is None:
+        # Fall back to checking which transforms preserve the board
+        current_hash = board_hash(board)
+        board_preserving_transforms = []
+        for t in range(8):
+            transformed = transform_board(board, t)
+            if board_hash(transformed) == current_hash:
+                board_preserving_transforms.append(t)
+        
+        visited = set()
+        orbits = []
+        for pos in range(49):
+            if pos in visited:
+                continue
+            orbit = set()
+            orbit.add(pos)
+            for t in board_preserving_transforms:
+                new_pos = D4_FORWARD_POS[t, pos]
+                orbit.add(new_pos)
+            orbits.append(orbit)
+            visited.update(orbit)
+        return orbits
+    
+    # Get pattern info
+    pattern = PATTERNS[pattern_idx]
+    ph, pw = pattern.shape
+    offset_h, offset_w = ph // 2, pw // 2
+    
+    # For each position, compute the resulting board and its canonical hash
+    position_to_canonical = {}
+    
+    for pos in range(49):
+        row, col = pos // 7, pos % 7
+        
+        # Compute resulting board after placing pattern at this position
+        result_board = board.copy()
+        for pr in range(ph):
+            for pc in range(pw):
+                if pattern[pr, pc] == 1:
+                    br = row - offset_h + pr
+                    bc = col - offset_w + pc
+                    if 0 <= br < 7 and 0 <= bc < 7:
+                        result_board[br, bc] = 1
+        
+        # Get canonical hash
+        position_to_canonical[pos] = get_canonical_hash(result_board)
+    
+    # Group positions by their canonical hash
+    canonical_to_positions = {}
+    for pos, canonical in position_to_canonical.items():
+        if canonical not in canonical_to_positions:
+            canonical_to_positions[canonical] = set()
+        canonical_to_positions[canonical].add(pos)
+    
+    return list(canonical_to_positions.values())
+
+
+def normalize_probs_by_dynamic_orbit(probs: np.ndarray, board: np.ndarray, pattern_idx: int = None) -> np.ndarray:
+    """
+    Normalize probabilities so that symmetric positions (considering board state and pattern)
+    have the same probability.
+    
+    For each orbit (computed dynamically based on board and pattern), sum the probabilities
+    of all positions in the orbit, then assign that sum to all positions.
+    
+    Args:
+        probs: (50,) array of probabilities
+        board: Current 7x7 board state
+        pattern_idx: Index of pattern being placed
+    
+    Returns:
+        (50,) array with orbit-normalized probabilities
+    """
+    normalized = probs.copy()
+    
+    # Compute orbits dynamically based on current board and pattern
+    orbits = compute_dynamic_orbits(board, pattern_idx)
+    
+    for orbit in orbits:
+        # Sum probabilities in this orbit
+        orbit_sum = sum(probs[pos] for pos in orbit)
+        # Assign sum to all positions in orbit
+        for pos in orbit:
+            normalized[pos] = orbit_sum
+    
+    # Store action (49) is unchanged
+    return normalized
+
+
+# =============================================================================
+# Policy Network (copy from train.py for CPU loading)
+# =============================================================================
+
+class MaskablePPOPolicy(nn.Module):
+    """Actor-Critic policy for MaskablePPO."""
+    
+    def __init__(
+        self,
+        observation_space,
+        action_dim: int = 50,
+        features_dim: int = 256,
+        hidden_channels: int = 64,
+        num_res_blocks: int = 3,
+        kernel_size: int = 3,
+        scalar_embed_dim: int = 32,
+        pi_layers: list = [256, 128],
+        vf_layers: list = [256, 128],
+    ):
+        super().__init__()
+        
+        self.features_extractor = BingoCNNExtractor(
+            observation_space,
+            features_dim=features_dim,
+            hidden_channels=hidden_channels,
+            num_res_blocks=num_res_blocks,
+            kernel_size=kernel_size,
+            scalar_embed_dim=scalar_embed_dim,
+        )
+        
+        # Policy head
+        pi_layers_list = []
+        in_dim = features_dim
+        for out_dim in pi_layers:
+            pi_layers_list.extend([
+                nn.Linear(in_dim, out_dim),
+                nn.GELU(),
+            ])
+            in_dim = out_dim
+        pi_layers_list.append(nn.Linear(in_dim, action_dim))
+        self.policy_head = nn.Sequential(*pi_layers_list)
+        
+        # Value head
+        vf_layers_list = []
+        in_dim = features_dim
+        for out_dim in vf_layers:
+            vf_layers_list.extend([
+                nn.Linear(in_dim, out_dim),
+                nn.GELU(),
+            ])
+            in_dim = out_dim
+        vf_layers_list.append(nn.Linear(in_dim, 1))
+        self.value_head = nn.Sequential(*vf_layers_list)
+    
+    def forward(self, obs):
+        """Forward pass returning logits and values."""
+        features = self.features_extractor(obs)
+        logits = self.policy_head(features)
+        values = self.value_head(features)
+        return logits, values
+
+
+# =============================================================================
+# Simple CPU Environment State
+# =============================================================================
+
+class BingoState:
+    """Simple bingo state management for CPU inference."""
+    
+    def __init__(self, allow_store: bool = True):
+        self.board_size = 7
+        self.allow_store = allow_store
+        self.reset()
+    
+    def reset(self):
+        self.board = np.zeros((7, 7), dtype=np.int8)
+        self.stored_pattern_idx = -1
+        self.store_remaining = 2  # Only used for model action masking
+        self.is_first_turn = True
+        self.current_step = 0
+        self.history = []
+    
+    def get_pattern_obs(self, pattern_idx: int) -> np.ndarray:
+        """Get 7x7 padded pattern for observation."""
+        pattern = PATTERNS[pattern_idx]
+        padded = np.zeros((7, 7), dtype=np.int8)
+        ph, pw = pattern.shape
+        oh, ow = (7 - ph) // 2, (7 - pw) // 2
+        padded[oh:oh+ph, ow:ow+pw] = pattern
+        return padded
+    
+    def get_stored_pattern_obs(self) -> np.ndarray:
+        """Get stored pattern observation (zeros if none)."""
+        if self.stored_pattern_idx < 0:
+            return np.zeros((7, 7), dtype=np.int8)
+        return self.get_pattern_obs(self.stored_pattern_idx)
+    
+    def get_action_mask(self, pattern_idx: int) -> np.ndarray:
+        """Compute valid action mask for given pattern."""
+        pattern = PATTERNS[pattern_idx]
+        mask = np.zeros(50, dtype=bool)
+        
+        ph, pw = pattern.shape
+        offset_h, offset_w = ph // 2, pw // 2
+        
+        for r in range(7):
+            for c in range(7):
+                # Check if pattern overlaps with any empty cell
+                has_empty_overlap = False
+                for pr in range(ph):
+                    for pc in range(pw):
+                        if pattern[pr, pc] == 1:
+                            board_r = r - offset_h + pr
+                            board_c = c - offset_w + pc
+                            if 0 <= board_r < 7 and 0 <= board_c < 7:
+                                if self.board[board_r, board_c] == 0:
+                                    has_empty_overlap = True
+                                    break
+                    if has_empty_overlap:
+                        break
+                
+                if has_empty_overlap:
+                    mask[r * 7 + c] = True
+        
+        # Store action (action 49) - for GUI, always allow unless same pattern is stored
+        if self.allow_store:
+            same_pattern = self.stored_pattern_idx == pattern_idx
+            has_stored = self.stored_pattern_idx >= 0
+            cant_swap = has_stored and same_pattern
+            mask[49] = not cant_swap
+        else:
+            mask[49] = False
+        
+        return mask
+    
+    def get_model_action_mask(self, pattern_idx: int) -> np.ndarray:
+        """Get action mask for model inference (considers store_remaining for proper masking)."""
+        mask = self.get_action_mask(pattern_idx)
+        
+        # Apply store_remaining limit for model
+        if self.allow_store:
+            if self.store_remaining <= 0:
+                mask[49] = False
+        
+        return mask
+    
+    def apply_pattern(self, pattern_idx: int, center_row: int, center_col: int):
+        """Apply pattern to board at center position."""
+        pattern = PATTERNS[pattern_idx]
+        ph, pw = pattern.shape
+        offset_h, offset_w = ph // 2, pw // 2
+        
+        for pr in range(ph):
+            for pc in range(pw):
+                if pattern[pr, pc] == 1:
+                    board_r = center_row - offset_h + pr
+                    board_c = center_col - offset_w + pc
+                    if 0 <= board_r < 7 and 0 <= board_c < 7:
+                        self.board[board_r, board_c] = 1
+        
+        self.current_step += 1
+        self.is_first_turn = False
+        self.store_remaining = 1  # Reset for next turn (model only)
+    
+    def store_pattern(self, pattern_idx: int):
+        """Store the given pattern (no swap)."""
+        self.stored_pattern_idx = pattern_idx
+        self.store_remaining -= 1
+    
+    def swap_pattern(self, new_pattern_idx: int) -> int:
+        """Swap current pattern with stored. Returns the retrieved pattern index."""
+        old_stored = self.stored_pattern_idx
+        self.stored_pattern_idx = new_pattern_idx
+        self.store_remaining -= 1
+        return old_stored
+    
+    def save_state(self):
+        """Save current state to history."""
+        self.history.append({
+            'board': self.board.copy(),
+            'stored_pattern_idx': self.stored_pattern_idx,
+            'store_remaining': self.store_remaining,
+            'is_first_turn': self.is_first_turn,
+            'current_step': self.current_step,
+        })
+    
+    def undo(self) -> bool:
+        """Restore previous state. Returns True if successful."""
+        if not self.history:
+            return False
+        
+        state = self.history.pop()
+        self.board = state['board']
+        self.stored_pattern_idx = state['stored_pattern_idx']
+        self.store_remaining = state['store_remaining']
+        self.is_first_turn = state['is_first_turn']
+        self.current_step = state['current_step']
+        return True
+    
+    def to_dict(self) -> dict:
+        """Serialize state to dictionary for saving."""
+        return {
+            'board': self.board.tolist(),
+            'stored_pattern_idx': self.stored_pattern_idx,
+            'store_remaining': self.store_remaining,
+            'is_first_turn': self.is_first_turn,
+            'current_step': self.current_step,
+            'allow_store': self.allow_store,
+            'history': [
+                {
+                    'board': h['board'].tolist(),
+                    'stored_pattern_idx': h['stored_pattern_idx'],
+                    'store_remaining': h['store_remaining'],
+                    'is_first_turn': h['is_first_turn'],
+                    'current_step': h['current_step'],
+                }
+                for h in self.history
+            ]
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> 'BingoState':
+        """Deserialize state from dictionary."""
+        state = cls(allow_store=data.get('allow_store', True))
+        state.board = np.array(data.get('board', np.zeros((7, 7))), dtype=np.int8)
+        state.stored_pattern_idx = data.get('stored_pattern_idx', -1)
+        state.store_remaining = data.get('store_remaining', 2)
+        state.is_first_turn = data.get('is_first_turn', True)
+        state.current_step = data.get('current_step', 0)
+        state.history = [
+            {
+                'board': np.array(h.get('board', np.zeros((7, 7))), dtype=np.int8),
+                'stored_pattern_idx': h.get('stored_pattern_idx', -1),
+                'store_remaining': h.get('store_remaining', 2),
+                'is_first_turn': h.get('is_first_turn', True),
+                'current_step': h.get('current_step', 0),
+            }
+            for h in data.get('history', [])
+        ]
+        return state
+
+
+# =============================================================================
+# Model Manager
+# =============================================================================
+
+class ModelManager:
+    """Manages loading and switching between models."""
+    
+    def __init__(self):
+        self.device = torch.device('cpu')
+        self.models = {}
+        self.current_model_name = None
+        self.policy = None
+        
+        # Create observation space for policy
+        from gymnasium import spaces
+        self.obs_space = spaces.Dict({
+            "board": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
+            "pattern": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
+            "stored_pattern": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
+            "has_stored": spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
+        })
+        
+        self._load_models()
+    
+    def _create_policy(self) -> MaskablePPOPolicy:
+        """Create policy network with default config."""
+        return MaskablePPOPolicy(
+            self.obs_space,
+            features_dim=256,
+            hidden_channels=64,
+            num_res_blocks=3,
+            kernel_size=3,
+            scalar_embed_dim=32,
+            pi_layers=[256, 128],
+            vf_layers=[256, 128],
+        )
+    
+    def _load_models(self):
+        """Load both models."""
+        model_paths = {
+            'store': 'model/best_model.pt',
+            'no_store': 'model/best_model_no_store.pt',
+        }
+        
+        for name, path in model_paths.items():
+            if os.path.exists(path):
+                policy = self._create_policy()
+                policy.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
+                policy.eval()
+                self.models[name] = policy
+                print(f"Loaded model: {name} from {path}")
+            else:
+                print(f"Warning: Model not found: {path}")
+        
+        # Set default model
+        if 'store' in self.models:
+            self.switch_model('store')
+        elif 'no_store' in self.models:
+            self.switch_model('no_store')
+    
+    def switch_model(self, name: str):
+        """Switch to specified model."""
+        if name in self.models:
+            self.current_model_name = name
+            self.policy = self.models[name]
+            return True
+        return False
+    
+    def get_d4_averaged_probs(
+        self,
+        board: np.ndarray,
+        pattern_idx: int,
+        stored_pattern_idx: int,
+        action_mask: np.ndarray = None,
+    ) -> np.ndarray:
+        """
+        Compute D4 symmetry-averaged action probabilities.
+        
+        Args:
+            board: Current board state (7x7)
+            pattern_idx: Index of current pattern
+            stored_pattern_idx: Index of stored pattern (-1 if none)
+            action_mask: Valid action mask (50,) - required for proper probability computation
+        
+        Returns:
+            (50,) array of averaged probabilities
+        """
+        if self.policy is None:
+            return np.zeros(50)
+        
+        if action_mask is None:
+            # Generate action mask if not provided
+            action_mask = np.ones(50, dtype=bool)
+        
+        all_probs = []
+        
+        pattern_obs = self._get_pattern_obs(pattern_idx)
+        stored_obs = self._get_pattern_obs(stored_pattern_idx) if stored_pattern_idx >= 0 else np.zeros((7, 7), dtype=np.int8)
+        has_stored = 1.0 if stored_pattern_idx >= 0 else 0.0
+        
+        for transform_idx in range(8):
+            # Transform observations
+            transformed_board = transform_board(board, transform_idx)
+            transformed_pattern = transform_board(pattern_obs, transform_idx)
+            transformed_stored = transform_board(stored_obs, transform_idx)
+            
+            # Transform action mask: we need to transform positions 0-48
+            # Forward transform maps original -> transformed
+            transformed_mask = np.zeros(50, dtype=bool)
+            for orig_pos in range(49):
+                # Find where this position goes in transformed space
+                new_pos = D4_FORWARD_POS[transform_idx, orig_pos]
+                transformed_mask[new_pos] = action_mask[orig_pos]
+            transformed_mask[49] = action_mask[49]  # Store action unchanged
+            
+            # Create observation tensors
+            obs = {
+                'board': torch.from_numpy(transformed_board).float().unsqueeze(0),
+                'pattern': torch.from_numpy(transformed_pattern).float().unsqueeze(0),
+                'stored_pattern': torch.from_numpy(transformed_stored).float().unsqueeze(0),
+                'has_stored': torch.tensor([[has_stored]], dtype=torch.float32),
+            }
+            
+            # Get logits
+            with torch.no_grad():
+                logits, _ = self.policy(obs)
+            
+            # Apply action mask: set invalid actions to -inf
+            logits = logits.squeeze(0).clone()
+            mask_tensor = torch.from_numpy(transformed_mask)
+            logits[~mask_tensor] = float('-inf')
+            
+            # Compute probabilities (softmax over valid actions only)
+            probs = F.softmax(logits, dim=-1).numpy()
+            
+            # Inverse transform to original coordinate system
+            original_probs = inverse_transform_probs(probs, transform_idx)
+            
+            all_probs.append(original_probs)
+        
+        # Average across all 8 transforms
+        averaged_probs = np.mean(all_probs, axis=0)
+        
+        # Normalize by orbit: symmetric positions (considering board state and pattern) get the same probability
+        normalized_probs = normalize_probs_by_dynamic_orbit(averaged_probs, board, pattern_idx)
+        
+        return normalized_probs
+    
+    def _get_pattern_obs(self, pattern_idx: int) -> np.ndarray:
+        """Get 7x7 padded pattern observation."""
+        if pattern_idx < 0:
+            return np.zeros((7, 7), dtype=np.int8)
+        pattern = PATTERNS[pattern_idx]
+        padded = np.zeros((7, 7), dtype=np.int8)
+        ph, pw = pattern.shape
+        oh, ow = (7 - ph) // 2, (7 - pw) // 2
+        padded[oh:oh+ph, ow:ow+pw] = pattern
+        return padded
+
+
+# =============================================================================
+# GUI Widgets
+# =============================================================================
+
+class BoardWidget(QTableWidget):
+    """7x7 Bingo board display."""
+    
+    def __init__(self, parent=None):
+        super().__init__(7, 7, parent)
+        self.cell_size = 60
+        self._setup_ui()
+    
+    def _setup_ui(self):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-
         self.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.horizontalHeader().hide()
         self.verticalHeader().hide()
-
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.setSelectionMode(QAbstractItemView.NoSelection)
-
-        for i in range(self.board_size):
+        
+        for i in range(7):
             self.setColumnWidth(i, self.cell_size)
             self.setRowHeight(i, self.cell_size)
-
-        total_size = self.board_size * self.cell_size
+        
+        total_size = 7 * self.cell_size
         self.setFixedSize(total_size + 2, total_size + 2)
-
-        self.clearBoard()
-
-    def clearBoard(self):
-        for i in range(self.board_size):
-            for j in range(self.board_size):
+        
+        self._init_items()
+    
+    def _init_items(self):
+        for i in range(7):
+            for j in range(7):
                 item = QTableWidgetItem()
                 item.setFlags(Qt.ItemIsEnabled)
                 item.setBackground(QColor("white"))
                 self.setItem(i, j, item)
-
-    def updateBoard(self, board, preview_info=None):
-        for i in range(self.board_size):
-            for j in range(self.board_size):
+    
+    def update_display(
+        self,
+        board: np.ndarray,
+        probs: np.ndarray = None,
+        action_mask: np.ndarray = None,
+        swap_probs: np.ndarray = None,
+        swap_mask: np.ndarray = None,
+        threshold: float = 0.10,
+    ):
+        """
+        Update board display with probabilities.
+        
+        Args:
+            board: Current board state (7x7)
+            probs: Position probabilities (50,) - only first 49 used
+            action_mask: Valid action mask (50,)
+            swap_probs: Probabilities for placing retrieved pattern after swap (50,)
+            swap_mask: Valid action mask for swap placement (50,)
+            threshold: Minimum probability to display (default 10%)
+        """
+        for i in range(7):
+            for j in range(7):
                 item = self.item(i, j)
+                pos = i * 7 + j
+                
+                # Get probabilities
+                prob = probs[pos] if probs is not None else 0
+                swap_prob = swap_probs[pos] if swap_probs is not None else 0
+                
+                # Check valid positions
+                has_main_prob = action_mask is not None and action_mask[pos] and prob >= threshold
+                has_swap_prob = swap_mask is not None and swap_mask[pos] and swap_prob >= threshold
+                
                 if board[i, j] == 1:
-                    item.setBackground(QColor("gray"))
+                    # Filled cell - but still show swap prob if applicable
+                    if has_swap_prob:
+                        # Filled cell with swap probability - dark green overlay
+                        intensity = min(swap_prob / 0.5, 1.0)
+                        lightness = 0.4 - intensity * 0.2  # Darker range
+                        color = QColor.fromHslF(0.35, 0.6, lightness)  # Dark green
+                        item.setBackground(color)
+                        item.setText(f"↔{swap_prob*100:.0f}%")
+                        item.setTextAlignment(Qt.AlignCenter)
+                        item.setForeground(QColor("white"))
+                    else:
+                        # Just filled
+                        item.setBackground(QColor("#555555"))
+                        item.setText("")
+                elif has_main_prob and has_swap_prob:
+                    # Both main and swap - show combined (purple)
+                    # 왼쪽: 현재 패턴 확률, 오른쪽: 교환 후 가져온 패턴 확률
+                    max_prob = max(prob, swap_prob)
+                    intensity = min(max_prob / 0.5, 1.0)
+                    lightness = 0.9 - intensity * 0.5
+                    color = QColor.fromHslF(0.8, 0.7, lightness)  # Purple
+                    item.setBackground(color)
+                    item.setText(f"{prob*100:.0f}↔{swap_prob*100:.0f}")
+                    item.setTextAlignment(Qt.AlignCenter)
+                    item.setForeground(QColor("white") if lightness < 0.5 else QColor("black"))
+                elif has_main_prob:
+                    # Main placement - blue
+                    intensity = min(prob / 0.5, 1.0)
+                    lightness = 0.9 - intensity * 0.5
+                    color = QColor.fromHslF(0.6, 0.8, lightness)  # Blue
+                    item.setBackground(color)
+                    item.setText(f"{prob*100:.0f}%")
+                    item.setTextAlignment(Qt.AlignCenter)
+                    item.setForeground(QColor("white") if lightness < 0.5 else QColor("black"))
+                elif has_swap_prob:
+                    # Swap placement only - green
+                    intensity = min(swap_prob / 0.5, 1.0)
+                    lightness = 0.9 - intensity * 0.5
+                    color = QColor.fromHslF(0.35, 0.8, lightness)  # Green
+                    item.setBackground(color)
+                    item.setText(f"↔{swap_prob*100:.0f}%")
+                    item.setTextAlignment(Qt.AlignCenter)
+                    item.setForeground(QColor("white") if lightness < 0.5 else QColor("black"))
                 else:
+                    # Empty cell, no probability
                     item.setBackground(QColor("white"))
-
-        if preview_info is not None:
-            agent_action = preview_info["agent_action"]
-            a_row, a_col = agent_action
-
-            pattern = preview_info["pattern"]
-            new_board = apply_pattern_to_board(board, pattern, a_row, a_col)
-            diff = new_board - board
-            for i in range(self.board_size):
-                for j in range(self.board_size):
-                    if diff[i, j] == 1:
-                        self.item(i, j).setBackground(QColor("lightblue"))
-            self.item(a_row, a_col).setBackground(QColor("blue"))
+                    item.setText("")
 
 
 class PatternListWidget(QListWidget):
-    def __init__(self, flip_patterns, parent=None):
+    """Pattern selection widget."""
+    
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.flip_patterns = flip_patterns
-        self.parent_gui = None
-        self.initUI()
-
-    def initUI(self):
+        self._setup_ui()
+    
+    def _setup_ui(self):
         self.setViewMode(QListWidget.IconMode)
-        self.setIconSize(QSize(50, 50))
+        self.setIconSize(QSize(60, 60))
         self.setResizeMode(QListWidget.Adjust)
         self.setMovement(QListWidget.Static)
-
-        for idx, pattern in enumerate(self.flip_patterns):
-            trimmed = trim_pattern(pattern)
-            icon = self.createPatternIcon(trimmed)
+        self.setSpacing(5)
+        self.setMaximumHeight(100)
+        
+        for idx, pattern in enumerate(PATTERNS):
+            icon = self._create_icon(pattern)
             item = QListWidgetItem()
             item.setIcon(icon)
             item.setData(Qt.UserRole, idx)
+            item.setToolTip(PATTERN_NAMES[idx])
             self.addItem(item)
-
-    def createPatternIcon(self, pattern):
-        padded = pad_to_min_size(pattern)
-        rows, cols = padded.shape
-        cell_size = 20
-
-        pixmap = QPixmap(cols * cell_size, rows * cell_size)
-        pixmap.fill(Qt.white)
-
-        painter = QPainter(pixmap)
-        for i in range(rows):
-            for j in range(cols):
-                x = j * cell_size
-                y = i * cell_size
-                rect = (x, y, cell_size, cell_size)
-                if padded[i, j] == 1:
-                    painter.fillRect(*rect, QColor("black"))
-                painter.setPen(Qt.gray)
-                painter.drawRect(*rect)
-
-        painter.end()
-        return pixmap
     
-    def mousePressEvent(self, event):
-        item = self.itemAt(event.position().toPoint())
-        if event.button() == Qt.RightButton and item is not None:
-            if self.parent_gui:
-                self.parent_gui.on_next()
-        else:
-            super().mousePressEvent(event)
+    def _create_icon(self, pattern: np.ndarray) -> QPixmap:
+        """Create icon for pattern."""
+        # Pad to square
+        h, w = pattern.shape
+        size = max(h, w)
+        padded = np.zeros((size, size), dtype=np.int8)
+        oh, ow = (size - h) // 2, (size - w) // 2
+        padded[oh:oh+h, ow:ow+w] = pattern
+        
+        cell_size = 60 // size
+        pixmap = QPixmap(size * cell_size, size * cell_size)
+        pixmap.fill(Qt.white)
+        
+        painter = QPainter(pixmap)
+        for i in range(size):
+            for j in range(size):
+                x, y = j * cell_size, i * cell_size
+                if padded[i, j] == 1:
+                    painter.fillRect(x, y, cell_size, cell_size, QColor("#333333"))
+                painter.setPen(QColor("#cccccc"))
+                painter.drawRect(x, y, cell_size, cell_size)
+        painter.end()
+        
+        return pixmap
 
+
+# =============================================================================
+# Stored Pattern Widget
+# =============================================================================
 
 class StoredPatternWidget(QWidget):
-    """저장된 패턴 표시 위젯"""
-    def __init__(self, board_size, parent=None):
-        super().__init__(parent)
-        self.board_size = board_size
-        self.cell_size = 15
-        self.stored_pattern = None
-        self.setFixedSize(board_size * self.cell_size + 4, board_size * self.cell_size + 4)
+    """Widget to display the stored pattern."""
     
-    def setStoredPattern(self, pattern):
-        self.stored_pattern = pattern
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.stored_pattern_idx = -1
+        self.cell_size = 12
+        self.setFixedSize(7 * self.cell_size + 4, 7 * self.cell_size + 4)
+    
+    def set_pattern(self, pattern_idx: int):
+        """Set the stored pattern index (-1 for none)."""
+        self.stored_pattern_idx = pattern_idx
         self.update()
     
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("white"))
         
-        if self.stored_pattern is not None:
-            for i in range(self.board_size):
-                for j in range(self.board_size):
+        if self.stored_pattern_idx >= 0:
+            # Draw the pattern
+            pattern = PATTERNS[self.stored_pattern_idx]
+            padded = np.zeros((7, 7), dtype=np.int8)
+            ph, pw = pattern.shape
+            oh, ow = (7 - ph) // 2, (7 - pw) // 2
+            padded[oh:oh+ph, ow:ow+pw] = pattern
+            
+            for i in range(7):
+                for j in range(7):
                     x = j * self.cell_size + 2
                     y = i * self.cell_size + 2
-                    if self.stored_pattern[i, j] == 1:
-                        painter.fillRect(x, y, self.cell_size-1, self.cell_size-1, QColor("darkgreen"))
+                    if padded[i, j] == 1:
+                        painter.fillRect(x, y, self.cell_size - 1, self.cell_size - 1, QColor("#2E7D32"))
                     else:
-                        painter.setPen(QColor("lightgray"))
-                        painter.drawRect(x, y, self.cell_size-1, self.cell_size-1)
+                        painter.setPen(QColor("#e0e0e0"))
+                        painter.drawRect(x, y, self.cell_size - 1, self.cell_size - 1)
         else:
             painter.setPen(QColor("gray"))
             painter.drawText(self.rect(), Qt.AlignCenter, "없음")
@@ -208,300 +854,635 @@ class StoredPatternWidget(QWidget):
         painter.end()
 
 
+# =============================================================================
+# Main Window
+# =============================================================================
+
 class BingoGUI(QMainWindow):
+    """Main application window."""
+    
+    # 저장 파일 경로 (실행 파일과 같은 디렉토리)
+    SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bingo_save.json')
+    
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Trickcal Bingo")
-        self.resize(700, 650)
-
-        self.env = BingoEnv(board_size=7)
-        self.env._choose_new_pattern = lambda: None
-
-        try:
-            self.model = MaskablePPO.load("model/best_model.zip")
-        except:
-            self.model = None
-            print("Warning: Model not found. Agent recommendations disabled.")
-
-        self.board_size = self.env.board_size
-        self.board = self.env.board.copy()
-        self.history = []
-        self.action_log = []
-        self.preview_info = None
-        self.last_selected_item = None
-
-        self.initUI()
-        self.load_log()
-
-    def initUI(self):
+        self.setWindowTitle("Trickcal Bingo AI Assistant")
+        self.resize(750, 600)
+        
+        # Initialize components
+        self.model_manager = ModelManager()
+        self.state = BingoState(allow_store=self.model_manager.current_model_name == 'store')
+        self.selected_pattern_idx = None
+        self.current_probs = None  # Store current probabilities
+        
+        self._setup_ui()
+        
+        # 저장된 상태가 있으면 복구 여부 확인
+        self._try_load_saved_state()
+        
+        self._update_display()
+    
+    def _setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
-
-        # 좌측: 빙고판(상단)과 패턴 리스트(하단)
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
-        main_layout.addWidget(left_widget, stretch=2)
-
-        self.board_widget = BoardTableWidget(self.board_size)
-        left_layout.addWidget(self.board_widget)
-
-        self.pattern_list = PatternListWidget(self.env.flip_patterns)
-        self.pattern_list.parent_gui = self
-        self.pattern_list.itemClicked.connect(self.on_pattern_clicked)
+        
+        # Left panel: Board + Pattern list
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        main_layout.addWidget(left_panel, stretch=2)
+        
+        # Board
+        self.board_widget = BoardWidget()
+        left_layout.addWidget(self.board_widget, alignment=Qt.AlignCenter)
+        
+        # Pattern label
+        pattern_label = QLabel("패턴 선택 (클릭하여 배치 위치 확인):")
+        font = pattern_label.font()
+        font.setBold(True)
+        pattern_label.setFont(font)
+        left_layout.addWidget(pattern_label)
+        
+        # Pattern list
+        self.pattern_list = PatternListWidget()
+        self.pattern_list.itemClicked.connect(self._on_pattern_clicked)
+        self.pattern_list.itemDoubleClicked.connect(self._on_pattern_double_clicked)
         left_layout.addWidget(self.pattern_list)
-
-        # 우측: 버튼 및 상태 표시
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
-        main_layout.addWidget(right_widget, stretch=1)
-
-        # 이전/다음/초기화 버튼
-        self.prev_button = QPushButton("이전")
-        self.prev_button.clicked.connect(self.on_prev)
-        right_layout.addWidget(self.prev_button)
-
-        self.next_button = QPushButton("다음")
-        self.next_button.clicked.connect(self.on_next)
-        right_layout.addWidget(self.next_button)
-
-        self.reset_button = QPushButton("초기화")
-        self.reset_button.clicked.connect(self.on_reset)
-        right_layout.addWidget(self.reset_button)
-
-        right_layout.addSpacing(20)
-
-        # 보관 섹션
-        store_group = QGroupBox("패턴 보관")
-        store_layout = QVBoxLayout(store_group)
         
-        self.store_button = QPushButton("현재 패턴 보관")
-        self.store_button.clicked.connect(self.on_store)
-        store_layout.addWidget(self.store_button)
+        left_layout.addStretch()
         
-        self.store_remaining_label = QLabel("남은 보관 횟수: 2")
-        store_layout.addWidget(self.store_remaining_label)
+        # Right panel: Controls
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        main_layout.addWidget(right_panel, stretch=1)
         
-        store_layout.addWidget(QLabel("저장된 패턴:"))
-        self.stored_pattern_widget = StoredPatternWidget(self.board_size)
-        store_layout.addWidget(self.stored_pattern_widget)
+        # Model selection group
+        model_group = QGroupBox("모델 선택")
+        model_layout = QVBoxLayout(model_group)
         
-        right_layout.addWidget(store_group)
-
-        # 턴 정보
+        self.model_label = QLabel()
+        font = self.model_label.font()
+        font.setBold(True)
+        font.setPointSize(font.pointSize() + 1)
+        self.model_label.setFont(font)
+        model_layout.addWidget(self.model_label)
+        
+        self.switch_model_btn = QPushButton("모델 전환")
+        self.switch_model_btn.clicked.connect(self._on_switch_model)
+        model_layout.addWidget(self.switch_model_btn)
+        
+        right_layout.addWidget(model_group)
+        
+        # Store group (only visible in store mode)
+        self.store_group = QGroupBox("패턴 보관")
+        store_layout = QVBoxLayout(self.store_group)
+        
+        # Stored pattern display
+        store_display_layout = QHBoxLayout()
+        store_display_layout.addWidget(QLabel("저장된 패턴:"))
+        self.stored_pattern_widget = StoredPatternWidget()
+        store_display_layout.addWidget(self.stored_pattern_widget)
+        store_display_layout.addStretch()
+        store_layout.addLayout(store_display_layout)
+        
+        # Store button with probability
+        self.store_btn = QPushButton("보관/교환 (선택 후 확률 표시)")
+        self.store_btn.clicked.connect(self._on_store)
+        self.store_btn.setEnabled(False)
+        store_layout.addWidget(self.store_btn)
+        
+        right_layout.addWidget(self.store_group)
+        
+        # Info group
+        info_group = QGroupBox("게임 정보")
+        info_layout = QVBoxLayout(info_group)
+        
         self.turn_label = QLabel("턴: 0")
-        right_layout.addWidget(self.turn_label)
-
+        info_layout.addWidget(self.turn_label)
+        
+        self.filled_label = QLabel("채워진 칸: 0 / 49")
+        info_layout.addWidget(self.filled_label)
+        
+        right_layout.addWidget(info_group)
+        
+        # Action buttons
+        action_group = QGroupBox("동작")
+        action_layout = QVBoxLayout(action_group)
+        
+        self.confirm_btn = QPushButton("선택 확정 (클릭한 칸에 배치)")
+        self.confirm_btn.clicked.connect(self._on_confirm)
+        self.confirm_btn.setEnabled(False)
+        action_layout.addWidget(self.confirm_btn)
+        
+        self.undo_btn = QPushButton("이전으로")
+        self.undo_btn.clicked.connect(self._on_undo)
+        action_layout.addWidget(self.undo_btn)
+        
+        self.reset_btn = QPushButton("초기화")
+        self.reset_btn.clicked.connect(self._on_reset)
+        action_layout.addWidget(self.reset_btn)
+        
+        right_layout.addWidget(action_group)
+        
+        # Probability threshold info
+        info_label = QLabel(
+            "■ 확률 10% 이상인 위치만 표시됩니다.\n"
+            "■ 색이 진할수록 높은 확률입니다.\n\n"
+            "색상 안내:\n"
+            "  • 파랑: 현재 패턴 배치 확률\n"
+            "  • 초록(↔): 교환 후 가져온 패턴 배치 확률\n"
+            "  • 보라(A↔B): 양쪽 다 가능\n"
+            "    (A: 현재 패턴, B: 교환 후 패턴)"
+        )
+        info_label.setStyleSheet("color: gray; font-size: 11px;")
+        info_label.setWordWrap(True)
+        right_layout.addWidget(info_label)
+        
         right_layout.addStretch()
-
-        self.update_board_display()
-        self.update_store_ui()
-
-    def on_pattern_clicked(self, item):
-        if item == self.last_selected_item:
-            self.pattern_list.clearSelection()
-            self.preview_info = None
-            self.last_selected_item = None
-            self.update_board_display()
-            return
-
-        self.last_selected_item = item
-
-        pattern_idx = item.data(Qt.UserRole)
-
-        self.env.current_pattern = self.env.flip_patterns[pattern_idx]
-        self.env.current_cost = self.env.pattern_costs[pattern_idx]
-
-        if self.model:
-            obs = self.env._get_obs()
-            action, _ = self.model.predict(obs, deterministic=True, action_masks=obs["action_mask"])
-            action = int(action)
-            
-            # 보관 액션인 경우 처리
-            if action == self.env.store_action:
-                # 보관을 추천하는 경우 - 위치 액션 중 best 선택
-                mask = obs["action_mask"][:-1]
-                valid_positions = np.where(mask == 1)[0]
-                if len(valid_positions) > 0:
-                    action = valid_positions[0]  # 첫 번째 유효 위치
-                else:
-                    self.preview_info = None
-                    self.update_board_display()
-                    return
-            
-            agent_action = divmod(action, self.board_size)
+        
+        # Connect board click
+        self.board_widget.cellClicked.connect(self._on_cell_clicked)
+        self.board_widget.cellDoubleClicked.connect(self._on_cell_double_clicked)
+        
+        self._update_model_label()
+        self._update_store_visibility()
+    
+    def _update_model_label(self):
+        """Update model label text."""
+        if self.model_manager.current_model_name == 'store':
+            self.model_label.setText("현재: 교환 허용 모드")
+            self.model_label.setStyleSheet("color: #2196F3;")
         else:
-            # 모델 없으면 첫 유효 위치
-            mask = obs["action_mask"][:-1]
-            valid_positions = np.where(mask == 1)[0]
-            if len(valid_positions) > 0:
-                action = valid_positions[0]
-                agent_action = divmod(action, self.board_size)
-            else:
-                self.preview_info = None
-                self.update_board_display()
+            self.model_label.setText("현재: 교환 비허용 모드")
+            self.model_label.setStyleSheet("color: #FF9800;")
+    
+    def _update_store_visibility(self):
+        """Show/hide store group based on model mode."""
+        is_store_mode = self.model_manager.current_model_name == 'store'
+        self.store_group.setVisible(is_store_mode)
+    
+    def _on_switch_model(self):
+        """Switch between models."""
+        if self.model_manager.current_model_name == 'store':
+            new_model = 'no_store'
+        else:
+            new_model = 'store'
+        
+        if new_model not in self.model_manager.models:
+            QMessageBox.warning(self, "경고", f"'{new_model}' 모델을 찾을 수 없습니다.")
+            return
+        
+        # Confirm if game in progress
+        if self.state.current_step > 0:
+            reply = QMessageBox.question(
+                self, "확인",
+                "게임이 진행 중입니다. 모델을 전환하면 게임이 초기화됩니다.\n계속하시겠습니까?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
                 return
-
-        self.preview_info = {
-            "pattern_idx": pattern_idx,
-            "agent_action": agent_action,
-            "pattern": self.env.current_pattern
-        }
-        self.update_board_display()
-
-    def on_next(self):
-        if self.preview_info is None:
-            return
-
-        self.history.append({
-            "board": self.board.copy(),
-            "stored_pattern": self.env.stored_pattern.copy() if self.env.stored_pattern is not None else None,
-            "stored_pattern_idx": self.env.stored_pattern_idx,
-            "store_remaining": self.env.store_remaining,
-            "is_first_turn": self.env.is_first_turn
-        })
-        self.action_log.append({
-            "action_type": "place",
-            "pattern_idx": self.preview_info["pattern_idx"],
-            "agent_action": self.preview_info["agent_action"]
-        })
-
-        row, col = self.preview_info["agent_action"]
-        action = row * self.board_size + col
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        self.board = self.env.board.copy()
-        self.preview_info = None
-        self.update_board_display()
-        self.update_store_ui()
+        
+        self.model_manager.switch_model(new_model)
+        self.state = BingoState(allow_store=(new_model == 'store'))
+        self.selected_pattern_idx = None
+        self.current_probs = None
         self.pattern_list.clearSelection()
-        self.last_selected_item = None
-
-    def on_prev(self):
-        if not self.history:
+        self._update_model_label()
+        self._update_store_visibility()
+        self._update_display()
+    
+    def _on_store(self):
+        """Handle store/swap button click."""
+        if self.selected_pattern_idx is None:
             return
         
-        state = self.history.pop()
-        self.board = state["board"]
-        self.env.board = self.board.copy()
-        self.env.stored_pattern = state["stored_pattern"]
-        self.env.stored_pattern_idx = state["stored_pattern_idx"]
-        self.env.store_remaining = state["store_remaining"]
-        self.env.is_first_turn = state["is_first_turn"]
-        
-        if self.action_log:
-            self.action_log.pop()
-        
-        self.preview_info = None
-        self.update_board_display()
-        self.update_store_ui()
-
-    def on_store(self):
-        """패턴 보관 버튼 클릭"""
-        if self.last_selected_item is None:
-            QMessageBox.information(self, "알림", "먼저 패턴을 선택하세요.")
+        # Check if can store
+        if not self.state.allow_store:
             return
         
-        if not self.env._can_store():
-            QMessageBox.warning(self, "경고", "보관할 수 없습니다.")
+        same_pattern = self.state.stored_pattern_idx == self.selected_pattern_idx
+        has_stored = self.state.stored_pattern_idx >= 0
+        cant_swap = has_stored and same_pattern
+        
+        if cant_swap:
+            QMessageBox.warning(self, "경고", "같은 패턴은 교환할 수 없습니다.")
             return
         
-        # 히스토리 저장
-        self.history.append({
-            "board": self.board.copy(),
-            "stored_pattern": self.env.stored_pattern.copy() if self.env.stored_pattern is not None else None,
-            "stored_pattern_idx": self.env.stored_pattern_idx,
-            "store_remaining": self.env.store_remaining,
-            "is_first_turn": self.env.is_first_turn
-        })
-        self.action_log.append({
-            "action_type": "store",
-            "pattern_idx": self.env.current_pattern_idx
-        })
+        # Save state for undo
+        self.state.save_state()
         
-        # 보관 실행
-        self.env._do_store()
-        self.update_store_ui()
+        # Perform store/swap
+        if has_stored:
+            # Swap: exchange current pattern with stored pattern
+            old_stored = self.state.swap_pattern(self.selected_pattern_idx)
+            
+            # 교환 후 가져온 패턴을 자동 선택
+            self.selected_pattern_idx = old_stored
+            self.current_probs = None
+            
+            # 패턴 리스트에서 해당 패턴 선택
+            for i in range(self.pattern_list.count()):
+                item = self.pattern_list.item(i)
+                if item.data(Qt.UserRole) == old_stored:
+                    self.pattern_list.setCurrentItem(item)
+                    break
+            
+            self.confirm_btn.setEnabled(False)
+            self.store_btn.setEnabled(False)
+        else:
+            # Store: save current pattern
+            self.state.store_pattern(self.selected_pattern_idx)
+            
+            # Clear selection
+            self.selected_pattern_idx = None
+            self.current_probs = None
+            self.pattern_list.clearSelection()
+            self.confirm_btn.setEnabled(False)
+            self.store_btn.setEnabled(False)
         
-        # 선택 초기화 및 UI 업데이트
+        self._update_display()
+    
+    def _on_pattern_clicked(self, item):
+        """Handle pattern selection. Second click on same pattern triggers auto-placement."""
+        pattern_idx = item.data(Qt.UserRole)
+        
+        # 먼저 패턴 선택 상태를 확인 (이전 상태 저장)
+        was_selected = self.selected_pattern_idx == pattern_idx
+        had_probs = self.current_probs is not None
+        
+        # 1. 패턴 선택 상태 변경 (항상 먼저)
+        self.selected_pattern_idx = pattern_idx
+        self.confirm_btn.setEnabled(False)
+        
+        # 2. 확률 계산 및 디스플레이 업데이트
+        self._update_display()
+        
+        # 3. 이미 선택되어 있었고 확률이 표시되어 있었다면 auto-placement 실행
+        if was_selected and had_probs:
+            self._auto_place_pattern(pattern_idx)
+    
+    def _on_pattern_double_clicked(self, item):
+        """Handle pattern double-click - same as second click."""
+        pattern_idx = item.data(Qt.UserRole)
+        
+        # 1. 패턴 선택 상태 변경 (먼저)
+        self.selected_pattern_idx = pattern_idx
+        self.confirm_btn.setEnabled(False)
+        
+        # 2. 확률 계산 및 디스플레이 업데이트
+        self._update_display()
+        
+        # 3. auto-placement 실행
+        self._auto_place_pattern(pattern_idx)
+    
+    def _auto_place_pattern(self, pattern_idx: int):
+        """Auto-place pattern based on model recommendation.
+        
+        Note: 호출 전에 반드시 _update_display()가 실행되어 있어야 합니다.
+        이를 통해 current_probs가 설정되어 있음을 보장합니다.
+        """
+        # 확률이 계산되지 않았다면 리턴 (호출 순서 오류 방지)
+        if self.current_probs is None:
+            return
+        
+        probs = self.current_probs
+        model_mask = self.state.get_model_action_mask(pattern_idx)
+        
+        # Find best action (considering model mask)
+        masked_probs = probs.copy()
+        masked_probs[~model_mask] = -1
+        best_action = int(np.argmax(masked_probs))
+        
+        # Save state for undo
+        self.state.save_state()
+        
+        if best_action == 49:
+            # Store/swap is recommended
+            has_stored = self.state.stored_pattern_idx >= 0
+            if has_stored:
+                # Swap and then place the retrieved pattern
+                old_stored = self.state.swap_pattern(pattern_idx)
+                
+                # Get best position for the retrieved pattern
+                swap_mask = self.state.get_model_action_mask(old_stored)
+                swap_probs = self.model_manager.get_d4_averaged_probs(
+                    self.state.board, old_stored, pattern_idx, action_mask=swap_mask
+                )
+                swap_masked_probs = swap_probs.copy()
+                swap_masked_probs[~swap_mask] = -1
+                swap_masked_probs[49] = -1  # Can't store again
+                best_pos = int(np.argmax(swap_masked_probs))
+                
+                if best_pos < 49 and swap_mask[best_pos]:
+                    row, col = best_pos // 7, best_pos % 7
+                    self.state.apply_pattern(old_stored, row, col)
+            else:
+                # Just store
+                self.state.store_pattern(pattern_idx)
+        else:
+            # Place at best position
+            row, col = best_action // 7, best_action % 7
+            self.state.apply_pattern(pattern_idx, row, col)
+        
+        # Clear selection
+        self.selected_pattern_idx = None
+        self.current_probs = None
         self.pattern_list.clearSelection()
-        self.last_selected_item = None
-        self.preview_info = None
-        self.update_board_display()
-
-    def on_reset(self):
+        self.confirm_btn.setEnabled(False)
+        
+        self._update_display()
+        self._check_game_complete()
+    
+    def _on_cell_clicked(self, row, col):
+        """Handle board cell click."""
+        if self.selected_pattern_idx is None:
+            return
+        
+        pos = row * 7 + col
+        action_mask = self.state.get_action_mask(self.selected_pattern_idx)
+        
+        if action_mask[pos]:
+            # Valid position selected
+            self._selected_position = (row, col)
+            self.confirm_btn.setEnabled(True)
+            self.confirm_btn.setText(f"확정: ({row}, {col})에 배치")
+        else:
+            self._selected_position = None
+            self.confirm_btn.setEnabled(False)
+            self.confirm_btn.setText("선택 확정 (클릭한 칸에 배치)")
+    
+    def _on_cell_double_clicked(self, row, col):
+        """Handle board cell double-click - directly place pattern."""
+        if self.selected_pattern_idx is None:
+            return
+        
+        pos = row * 7 + col
+        action_mask = self.state.get_action_mask(self.selected_pattern_idx)
+        
+        if action_mask[pos]:
+            # Save state for undo
+            self.state.save_state()
+            
+            # Apply pattern
+            self.state.apply_pattern(self.selected_pattern_idx, row, col)
+            
+            # Clear selection
+            self.selected_pattern_idx = None
+            self.pattern_list.clearSelection()
+            self.confirm_btn.setEnabled(False)
+            self.confirm_btn.setText("선택 확정 (클릭한 칸에 배치)")
+            
+            self._update_display()
+            self._check_game_complete()
+    
+    def _on_confirm(self):
+        """Confirm placement at selected position."""
+        if self.selected_pattern_idx is None or not hasattr(self, '_selected_position'):
+            return
+        
+        row, col = self._selected_position
+        
+        # Save state for undo
+        self.state.save_state()
+        
+        # Apply pattern
+        self.state.apply_pattern(self.selected_pattern_idx, row, col)
+        
+        # Clear selection
+        self.selected_pattern_idx = None
+        self._selected_position = None
+        self.pattern_list.clearSelection()
+        self.confirm_btn.setEnabled(False)
+        self.confirm_btn.setText("선택 확정 (클릭한 칸에 배치)")
+        
+        self._update_display()
+        self._check_game_complete()
+    
+    def _check_game_complete(self):
+        """Check if game is complete and show message."""
+        if np.all(self.state.board == 1):
+            # 게임 완료 시 저장 파일 삭제
+            self._delete_save_file()
+            QMessageBox.information(
+                self, "완료!",
+                f"빙고 완성! 총 {self.state.current_step}턴 소요되었습니다."
+            )
+    
+    def _on_undo(self):
+        """Undo last action."""
+        if self.state.undo():
+            self.selected_pattern_idx = None
+            self.pattern_list.clearSelection()
+            self.confirm_btn.setEnabled(False)
+            self._update_display()
+    
+    def _on_reset(self):
+        """Reset game."""
         reply = QMessageBox.question(
-            self, "초기화", "정말 초기화하시겠습니까?",
+            self, "초기화",
+            "정말 초기화하시겠습니까?",
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
-            self.env.reset()
-            self.env._choose_new_pattern = lambda: None
-            self.board = self.env.board.copy()
-            self.history = []
-            self.action_log = []
-            self.preview_info = None
-            self.update_board_display()
-            self.update_store_ui()
-            if os.path.exists("bingo_log.json"):
-                os.remove("bingo_log.json")
-
-    def update_board_display(self):
-        self.board_widget.updateBoard(self.board, self.preview_info)
-        self.turn_label.setText(f"턴: {self.env.current_step}")
-
-    def update_store_ui(self):
-        self.store_remaining_label.setText(f"남은 보관 횟수: {self.env.store_remaining}")
-        self.stored_pattern_widget.setStoredPattern(self.env.stored_pattern)
-        self.store_button.setEnabled(self.env._can_store() and self.last_selected_item is not None)
-
+            self.state.reset()
+            self.selected_pattern_idx = None
+            self.pattern_list.clearSelection()
+            self.confirm_btn.setEnabled(False)
+            # 초기화 시 저장 파일 삭제
+            self._delete_save_file()
+            self._update_display()
+    
+    def _update_display(self):
+        """Update board display with current state and probabilities."""
+        probs = None
+        action_mask = None
+        store_prob = 0.0
+        swap_probs = None
+        swap_mask = None
+        
+        if self.selected_pattern_idx is not None:
+            # Get action mask for model (includes store_remaining limit)
+            model_action_mask = self.state.get_model_action_mask(self.selected_pattern_idx)
+            # Get action mask for GUI display (no store_remaining limit)
+            action_mask = self.state.get_action_mask(self.selected_pattern_idx)
+            
+            # Get D4 averaged probabilities (use model mask for correct inference)
+            probs = self.model_manager.get_d4_averaged_probs(
+                self.state.board,
+                self.selected_pattern_idx,
+                self.state.stored_pattern_idx,
+                action_mask=model_action_mask,
+            )
+            self.current_probs = probs
+            store_prob = probs[49]
+            
+            # If store is recommended and there's a stored pattern, compute swap placement
+            if store_prob >= 0.10 and self.state.stored_pattern_idx >= 0:
+                # Get action mask for the stored pattern (what we'd retrieve after swap)
+                swap_mask = self.state.get_action_mask(self.state.stored_pattern_idx)
+                swap_mask[49] = False  # Can't store again immediately after swap
+                
+                # Compute probabilities for placing the retrieved pattern
+                swap_probs = self.model_manager.get_d4_averaged_probs(
+                    self.state.board,
+                    self.state.stored_pattern_idx,  # The pattern we'd retrieve
+                    self.selected_pattern_idx,  # After swap, current pattern becomes stored
+                    action_mask=swap_mask,
+                )
+                # Store the swap probs for later use
+                self.current_swap_probs = swap_probs
+            else:
+                self.current_swap_probs = None
+        else:
+            self.current_probs = None
+            self.current_swap_probs = None
+        
+        self.board_widget.update_display(
+            self.state.board,
+            probs=probs,
+            action_mask=action_mask,
+            swap_probs=swap_probs,
+            swap_mask=swap_mask,
+            threshold=0.10,
+        )
+        
+        self.turn_label.setText(f"턴: {self.state.current_step}")
+        filled = np.sum(self.state.board)
+        self.filled_label.setText(f"채워진 칸: {filled} / 49")
+        self.undo_btn.setEnabled(len(self.state.history) > 0)
+        
+        # Update store UI
+        if self.state.allow_store:
+            self.stored_pattern_widget.set_pattern(self.state.stored_pattern_idx)
+            
+            # Update store button
+            if self.selected_pattern_idx is not None and action_mask is not None:
+                can_store = action_mask[49]
+                if can_store:
+                    # Show store probability on button
+                    self.store_btn.setText(f"보관/교환 ({store_prob*100:.1f}%)")
+                    self.store_btn.setEnabled(True)
+                    
+                    # Highlight button if store is recommended (high probability)
+                    if store_prob >= 0.5:
+                        self.store_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+                    elif store_prob >= 0.3:
+                        self.store_btn.setStyleSheet("background-color: #8BC34A;")
+                    else:
+                        self.store_btn.setStyleSheet("")
+                else:
+                    self.store_btn.setText("보관/교환 (불가)")
+                    self.store_btn.setEnabled(False)
+                    self.store_btn.setStyleSheet("")
+            else:
+                self.store_btn.setText("보관/교환 (패턴 선택 필요)")
+                self.store_btn.setEnabled(False)
+                self.store_btn.setStyleSheet("")
+    
+    def _try_load_saved_state(self):
+        """저장된 상태가 있으면 복구 여부를 물어보고 복구합니다."""
+        if not os.path.exists(self.SAVE_FILE):
+            return
+        
+        try:
+            with open(self.SAVE_FILE, 'r', encoding='utf-8') as f:
+                save_data = json.load(f)
+            
+            state_data = save_data.get('state', {})
+            current_step = state_data.get('current_step', 0)
+            stored_pattern_idx = state_data.get('stored_pattern_idx', -1)
+            filled = sum(sum(row) for row in state_data.get('board', []))
+            
+            # 게임 진행 여부 확인: 턴이 진행됐거나, 패턴이 저장되어 있거나, 칸이 채워져 있으면 진행 중
+            has_progress = current_step > 0 or stored_pattern_idx >= 0 or filled > 0
+            
+            if not has_progress:
+                # 진행된 내용이 전혀 없으면 삭제
+                os.remove(self.SAVE_FILE)
+                return
+            
+            # 저장된 패턴 정보도 표시
+            stored_info = ""
+            if stored_pattern_idx >= 0:
+                stored_info = f", 보관된 패턴: {PATTERN_NAMES[stored_pattern_idx]}"
+            
+            reply = QMessageBox.question(
+                self, "저장된 게임 발견",
+                f"이전에 저장된 게임이 있습니다.\n"
+                f"(턴: {current_step}, 채워진 칸: {filled}/49{stored_info})\n\n"
+                f"이어서 하시겠습니까?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                self._load_from_save_data(save_data)
+            else:
+                # 새 게임 시작 - 저장 파일 삭제
+                os.remove(self.SAVE_FILE)
+                
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            # 손상된 저장 파일 - 삭제
+            print(f"저장 파일 로드 실패: {e}")
+            if os.path.exists(self.SAVE_FILE):
+                os.remove(self.SAVE_FILE)
+    
+    def _load_from_save_data(self, save_data: dict):
+        """저장 데이터로부터 상태를 복구합니다."""
+        # 모델 전환 (필요시)
+        saved_model = save_data.get('model_name', 'store')
+        if saved_model != self.model_manager.current_model_name:
+            if saved_model in self.model_manager.models:
+                self.model_manager.switch_model(saved_model)
+                self._update_model_label()
+                self._update_store_visibility()
+        
+        # 상태 복구
+        self.state = BingoState.from_dict(save_data['state'])
+        self.selected_pattern_idx = None
+        self.current_probs = None
+        self.pattern_list.clearSelection()
+        self.confirm_btn.setEnabled(False)
+    
+    def _save_game_state(self):
+        """현재 게임 상태를 파일에 저장합니다."""
+        save_data = {
+            'model_name': self.model_manager.current_model_name,
+            'state': self.state.to_dict(),
+        }
+        
+        try:
+            with open(self.SAVE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(save_data, f, ensure_ascii=False, indent=2)
+        except IOError as e:
+            print(f"게임 저장 실패: {e}")
+    
+    def _delete_save_file(self):
+        """저장 파일을 삭제합니다."""
+        if os.path.exists(self.SAVE_FILE):
+            try:
+                os.remove(self.SAVE_FILE)
+            except IOError:
+                pass
+    
     def closeEvent(self, event):
-        log_data = {"action_log": self.action_log}
-
-        with open("bingo_log.json", "w", encoding="utf-8") as f:
-            json.dump(log_data, f, ensure_ascii=False, indent=4)
+        """창이 닫힐 때 게임 상태를 저장합니다."""
+        # 게임이 완료되었으면 저장 파일 삭제
+        if np.all(self.state.board == 1):
+            self._delete_save_file()
+        else:
+            # 진행 중인 게임이면 저장
+            self._save_game_state()
+        
         event.accept()
 
-    def load_log(self):
-        if os.path.exists("bingo_log.json"):
-            with open("bingo_log.json", "r", encoding="utf-8") as f:
-                log_data = json.load(f)
-            
-            self.env.reset()
-            self.env._choose_new_pattern = lambda: None
-            self.history = []
-            self.action_log = []
-            
-            for record in log_data.get("action_log", []):
-                # 히스토리 저장
-                self.history.append({
-                    "board": self.env.board.copy(),
-                    "stored_pattern": self.env.stored_pattern.copy() if self.env.stored_pattern is not None else None,
-                    "stored_pattern_idx": self.env.stored_pattern_idx,
-                    "store_remaining": self.env.store_remaining,
-                    "is_first_turn": self.env.is_first_turn
-                })
-                self.action_log.append(record)
-                
-                if record.get("action_type") == "store":
-                    pattern_idx = record["pattern_idx"]
-                    self.env.current_pattern = self.env.flip_patterns[pattern_idx]
-                    self.env.current_pattern_idx = pattern_idx
-                    self.env._do_store()
-                else:
-                    pattern_idx = record["pattern_idx"]
-                    agent_action = record["agent_action"]
-                    self.env.current_pattern = self.env.flip_patterns[pattern_idx]
-                    self.env.current_cost = self.env.pattern_costs[pattern_idx]
-                    action = agent_action[0] * self.board_size + agent_action[1]
-                    self.env.step(action)
-            
-            self.board = self.env.board.copy()
-            self.update_board_display()
-            self.update_store_ui()
 
+# =============================================================================
+# Entry Point
+# =============================================================================
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    
     window = BingoGUI()
     window.show()
     sys.exit(app.exec())

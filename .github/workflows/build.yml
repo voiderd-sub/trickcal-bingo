@@ -1,0 +1,96 @@
+name: Build Releases
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags like v1.0.0
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy pyside6 gymnasium pyyaml
+
+      - name: Build executable
+        run: |
+          pyinstaller trickcal_bingo.spec --noconfirm
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrickcalBingo-Windows
+          path: dist/TrickcalBingo.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install torch
+          pip install numpy pyside6 gymnasium pyyaml
+
+      - name: Build app bundle
+        run: |
+          pyinstaller trickcal_bingo.spec --noconfirm
+
+      - name: Create ZIP for macOS
+        run: |
+          cd dist
+          zip -r TrickcalBingo-macOS.zip TrickcalBingo.app || zip -r TrickcalBingo-macOS.zip TrickcalBingo
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrickcalBingo-macOS
+          path: dist/TrickcalBingo-macOS.zip
+
+  release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: TrickcalBingo-Windows
+          path: ./windows
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: TrickcalBingo-macOS
+          path: ./macos
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            windows/TrickcalBingo.exe
+            macos/TrickcalBingo-macOS.zip
+          generate_release_notes: true
