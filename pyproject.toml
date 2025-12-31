@@ -14,6 +14,12 @@ dependencies = [
     "tensorboard>=2.20.0",
 ]
 
+# uv dependency groups (uv sync --group build 스타일)
+[dependency-groups]
+build = [
+    "pyinstaller",
+]
+
 [[tool.uv.index]]
 name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"

@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import numpy as np
 
 
@@ -40,7 +39,7 @@ class ResidualBlock(nn.Module):
         return out
 
 
-class BingoCNNExtractor(BaseFeaturesExtractor):
+class BingoCNNExtractor(nn.Module):
     """
     ResNet-style CNN feature extractor for Bingo environment.
     
@@ -51,7 +50,6 @@ class BingoCNNExtractor(BaseFeaturesExtractor):
     
     Additional scalar features:
         - has_stored (0 or 1)
-        - store_remaining (0, 1, 2)
     """
     def __init__(
         self,
@@ -62,7 +60,8 @@ class BingoCNNExtractor(BaseFeaturesExtractor):
         kernel_size=3,
         scalar_embed_dim=32
     ):
-        super().__init__(observation_space, features_dim)
+        super().__init__()
+        self._features_dim = features_dim
 
         self.board_shape = observation_space['board'].shape
         input_channels = 3  # board + pattern + stored_pattern
@@ -112,6 +111,11 @@ class BingoCNNExtractor(BaseFeaturesExtractor):
                 nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
                 nn.init.zeros_(layer.bias)
 
+    @property
+    def features_dim(self):
+        """Output feature dimension (for compatibility)."""
+        return self._features_dim
+
     def forward(self, observations):
         # Extract tensors
         board = observations["board"].float()
@@ -139,7 +143,6 @@ class BingoCNNExtractor(BaseFeaturesExtractor):
 
 if __name__ == "__main__":
     from gymnasium import spaces
-    import numpy as np
     
     # Test observation space
     board_size = 7
@@ -147,10 +150,7 @@ if __name__ == "__main__":
         "board": spaces.Box(low=0, high=1, shape=(board_size, board_size), dtype=np.int8),
         "pattern": spaces.Box(low=0, high=1, shape=(board_size, board_size), dtype=np.int8),
         "stored_pattern": spaces.Box(low=0, high=1, shape=(board_size, board_size), dtype=np.int8),
-        "has_stored": spaces.Discrete(2),
-        "store_remaining": spaces.Discrete(3),
-        "cost": spaces.Box(low=0.0, high=10.0, shape=(), dtype=np.float32),
-        "action_mask": spaces.Box(0, 1, shape=(board_size ** 2 + 1,), dtype=np.uint8),
+        "has_stored": spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
     })
     
     extractor = BingoCNNExtractor(obs_space, features_dim=256)
@@ -162,10 +162,7 @@ if __name__ == "__main__":
         "board": torch.zeros(batch_size, board_size, board_size),
         "pattern": torch.zeros(batch_size, board_size, board_size),
         "stored_pattern": torch.zeros(batch_size, board_size, board_size),
-        "has_stored": torch.zeros(batch_size),
-        "store_remaining": torch.ones(batch_size),
-        "cost": torch.ones(batch_size),
-        "action_mask": torch.ones(batch_size, board_size ** 2 + 1),
+        "has_stored": torch.zeros(batch_size, 1),
     }
     
     output = extractor(dummy_obs)

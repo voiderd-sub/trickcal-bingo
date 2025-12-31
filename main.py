@@ -516,9 +516,14 @@ class ModelManager:
     
     def _load_models(self):
         """Load both models."""
+        if getattr(sys, 'frozen', False):
+            base_path = sys._MEIPASS
+        else:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        
         model_paths = {
-            'store': 'model/best_model.pt',
-            'no_store': 'model/best_model_no_store.pt',
+            'store': os.path.join(base_path, 'model', 'best_model.pt'),
+            'no_store': os.path.join(base_path, 'model', 'best_model_no_store.pt'),
         }
         
         for name, path in model_paths.items():
@@ -527,10 +532,6 @@ class ModelManager:
                 policy.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
                 policy.eval()
                 self.models[name] = policy
-                print(f"Loaded model: {name} from {path}")
-            else:
-                print(f"Warning: Model not found: {path}")
-        
         # Set default model
         if 'store' in self.models:
             self.switch_model('store')
@@ -710,22 +711,41 @@ class BoardWidget(QTableWidget):
                 has_swap_prob = swap_mask is not None and swap_mask[pos] and swap_prob >= threshold
                 
                 if board[i, j] == 1:
-                    # Filled cell - but still show swap prob if applicable
-                    if has_swap_prob:
-                        # Filled cell with swap probability - dark green overlay
+                    # Filled cell - show probability if valid placement center
+                    if has_main_prob and has_swap_prob:
+                        # Both main and swap on filled cell - purple with dark overlay
+                        max_prob = max(prob, swap_prob)
+                        intensity = min(max_prob / 0.5, 1.0)
+                        lightness = 0.35 - intensity * 0.15  # Dark purple range
+                        color = QColor.fromHslF(0.8, 0.6, lightness)
+                        item.setBackground(color)
+                        item.setText(f"{prob*100:.0f}↔{swap_prob*100:.0f}")
+                        item.setTextAlignment(Qt.AlignCenter)
+                        item.setForeground(QColor("white"))
+                    elif has_main_prob:
+                        # Main placement on filled cell - dark blue overlay
+                        intensity = min(prob / 0.5, 1.0)
+                        lightness = 0.35 - intensity * 0.15  # Dark blue range
+                        color = QColor.fromHslF(0.6, 0.6, lightness)
+                        item.setBackground(color)
+                        item.setText(f"{prob*100:.0f}%")
+                        item.setTextAlignment(Qt.AlignCenter)
+                        item.setForeground(QColor("white"))
+                    elif has_swap_prob:
+                        # Swap placement on filled cell - dark green overlay
                         intensity = min(swap_prob / 0.5, 1.0)
-                        lightness = 0.4 - intensity * 0.2  # Darker range
-                        color = QColor.fromHslF(0.35, 0.6, lightness)  # Dark green
+                        lightness = 0.35 - intensity * 0.15  # Dark green range
+                        color = QColor.fromHslF(0.35, 0.6, lightness)
                         item.setBackground(color)
                         item.setText(f"↔{swap_prob*100:.0f}%")
                         item.setTextAlignment(Qt.AlignCenter)
                         item.setForeground(QColor("white"))
                     else:
-                        # Just filled
+                        # Just filled, no valid placement
                         item.setBackground(QColor("#555555"))
                         item.setText("")
                 elif has_main_prob and has_swap_prob:
-                    # Both main and swap - show combined (purple)
+                    # Both main and swap on empty cell - show combined (purple)
                     # 왼쪽: 현재 패턴 확률, 오른쪽: 교환 후 가져온 패턴 확률
                     max_prob = max(prob, swap_prob)
                     intensity = min(max_prob / 0.5, 1.0)
@@ -736,7 +756,7 @@ class BoardWidget(QTableWidget):
                     item.setTextAlignment(Qt.AlignCenter)
                     item.setForeground(QColor("white") if lightness < 0.5 else QColor("black"))
                 elif has_main_prob:
-                    # Main placement - blue
+                    # Main placement on empty cell - blue
                     intensity = min(prob / 0.5, 1.0)
                     lightness = 0.9 - intensity * 0.5
                     color = QColor.fromHslF(0.6, 0.8, lightness)  # Blue
@@ -745,7 +765,7 @@ class BoardWidget(QTableWidget):
                     item.setTextAlignment(Qt.AlignCenter)
                     item.setForeground(QColor("white") if lightness < 0.5 else QColor("black"))
                 elif has_swap_prob:
-                    # Swap placement only - green
+                    # Swap placement on empty cell - green
                     intensity = min(swap_prob / 0.5, 1.0)
                     lightness = 0.9 - intensity * 0.5
                     color = QColor.fromHslF(0.35, 0.8, lightness)  # Green
@@ -861,11 +881,21 @@ class StoredPatternWidget(QWidget):
 class BingoGUI(QMainWindow):
     """Main application window."""
     
-    # 저장 파일 경로 (실행 파일과 같은 디렉토리)
-    SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bingo_save.json')
+    @staticmethod
+    def _get_save_file_path():
+        if getattr(sys, 'frozen', False):
+            return os.path.join(os.path.dirname(sys.executable), 'bingo_save.json')
+        else:
+            return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bingo_save.json')
+    
+    SAVE_FILE = None  # __init__에서 설정
     
     def __init__(self):
         super().__init__()
+        
+        # 저장 파일 경로 초기화 (PyInstaller 호환)
+        BingoGUI.SAVE_FILE = self._get_save_file_path()
+        
         self.setWindowTitle("Trickcal Bingo AI Assistant")
         self.resize(750, 600)
         
@@ -1136,57 +1166,56 @@ class BingoGUI(QMainWindow):
         self._auto_place_pattern(pattern_idx)
     
     def _auto_place_pattern(self, pattern_idx: int):
-        """Auto-place pattern based on model recommendation.
+        """Auto-place pattern based on Markov converged probabilities.
         
-        Note: 호출 전에 반드시 _update_display()가 실행되어 있어야 합니다.
-        이를 통해 current_probs가 설정되어 있음을 보장합니다.
+        Compares current pattern placement vs stored pattern placement
+        using the converged probabilities from _update_display().
         """
         # 확률이 계산되지 않았다면 리턴 (호출 순서 오류 방지)
         if self.current_probs is None:
             return
         
         probs = self.current_probs
-        model_mask = self.state.get_model_action_mask(pattern_idx)
+        swap_probs = self.current_swap_probs
         
-        # Find best action (considering model mask)
-        masked_probs = probs.copy()
-        masked_probs[~model_mask] = -1
-        best_action = int(np.argmax(masked_probs))
+        # Find best action from current pattern (positions 0-48 only)
+        current_mask = self.state.get_action_mask(pattern_idx)
+        current_masked = probs[:49].copy()
+        current_masked[~current_mask[:49]] = -1
+        best_current_pos = int(np.argmax(current_masked))
+        best_current_prob = current_masked[best_current_pos] if current_mask[best_current_pos] else -1
+        
+        # Find best action from swap pattern (if available)
+        best_swap_pos = -1
+        best_swap_prob = -1
+        if swap_probs is not None and self.state.stored_pattern_idx >= 0:
+            swap_mask = self.state.get_action_mask(self.state.stored_pattern_idx)
+            swap_masked = swap_probs[:49].copy()
+            swap_masked[~swap_mask[:49]] = -1
+            best_swap_pos = int(np.argmax(swap_masked))
+            best_swap_prob = swap_masked[best_swap_pos] if swap_mask[best_swap_pos] else -1
         
         # Save state for undo
         self.state.save_state()
         
-        if best_action == 49:
-            # Store/swap is recommended
-            has_stored = self.state.stored_pattern_idx >= 0
-            if has_stored:
-                # Swap and then place the retrieved pattern
-                old_stored = self.state.swap_pattern(pattern_idx)
-                
-                # Get best position for the retrieved pattern
-                swap_mask = self.state.get_model_action_mask(old_stored)
-                swap_probs = self.model_manager.get_d4_averaged_probs(
-                    self.state.board, old_stored, pattern_idx, action_mask=swap_mask
-                )
-                swap_masked_probs = swap_probs.copy()
-                swap_masked_probs[~swap_mask] = -1
-                swap_masked_probs[49] = -1  # Can't store again
-                best_pos = int(np.argmax(swap_masked_probs))
-                
-                if best_pos < 49 and swap_mask[best_pos]:
-                    row, col = best_pos // 7, best_pos % 7
-                    self.state.apply_pattern(old_stored, row, col)
-            else:
-                # Just store
-                self.state.store_pattern(pattern_idx)
-        else:
-            # Place at best position
-            row, col = best_action // 7, best_action % 7
+        # Decide action
+        if self.state.stored_pattern_idx < 0:
+            # 첫 턴: 무조건 보관 (수학적으로 최적)
+            self.state.store_pattern(pattern_idx)
+        elif best_swap_prob > best_current_prob:
+            # Swap and place stored pattern
+            old_stored = self.state.swap_pattern(pattern_idx)
+            row, col = best_swap_pos // 7, best_swap_pos % 7
+            self.state.apply_pattern(old_stored, row, col)
+        elif best_current_prob >= 0:
+            # Place current pattern
+            row, col = best_current_pos // 7, best_current_pos % 7
             self.state.apply_pattern(pattern_idx, row, col)
         
         # Clear selection
         self.selected_pattern_idx = None
         self.current_probs = None
+        self.current_swap_probs = None
         self.pattern_list.clearSelection()
         self.confirm_btn.setEnabled(False)
         
@@ -1293,45 +1322,81 @@ class BingoGUI(QMainWindow):
             self._update_display()
     
     def _update_display(self):
-        """Update board display with current state and probabilities."""
+        """Update board display with current state and probabilities.
+        
+        Uses Markov chain convergence to compute final placement probabilities
+        considering both current and stored patterns.
+        """
         probs = None
         action_mask = None
-        store_prob = 0.0
         swap_probs = None
         swap_mask = None
         
         if self.selected_pattern_idx is not None:
-            # Get action mask for model (includes store_remaining limit)
-            model_action_mask = self.state.get_model_action_mask(self.selected_pattern_idx)
-            # Get action mask for GUI display (no store_remaining limit)
+            # Get action mask for GUI display
             action_mask = self.state.get_action_mask(self.selected_pattern_idx)
             
-            # Get D4 averaged probabilities (use model mask for correct inference)
-            probs = self.model_manager.get_d4_averaged_probs(
-                self.state.board,
-                self.selected_pattern_idx,
-                self.state.stored_pattern_idx,
-                action_mask=model_action_mask,
-            )
-            self.current_probs = probs
-            store_prob = probs[49]
-            
-            # If store is recommended and there's a stored pattern, compute swap placement
-            if store_prob >= 0.10 and self.state.stored_pattern_idx >= 0:
-                # Get action mask for the stored pattern (what we'd retrieve after swap)
-                swap_mask = self.state.get_action_mask(self.state.stored_pattern_idx)
-                swap_mask[49] = False  # Can't store again immediately after swap
+            if self.state.stored_pattern_idx >= 0:
+                # === Markov Chain Convergence ===
+                # S1: current pattern A, stored pattern B
+                # S2: current pattern B, stored pattern A
+                # Compute stationary distribution for fair comparison
                 
-                # Compute probabilities for placing the retrieved pattern
-                swap_probs = self.model_manager.get_d4_averaged_probs(
+                # State S1: Current pattern
+                model_mask_S1 = self.state.get_model_action_mask(self.selected_pattern_idx)
+                probs_S1 = self.model_manager.get_d4_averaged_probs(
                     self.state.board,
-                    self.state.stored_pattern_idx,  # The pattern we'd retrieve
-                    self.selected_pattern_idx,  # After swap, current pattern becomes stored
-                    action_mask=swap_mask,
+                    self.selected_pattern_idx,
+                    self.state.stored_pattern_idx,
+                    action_mask=model_mask_S1,
                 )
-                # Store the swap probs for later use
+                swap_S1 = probs_S1[49]  # P(swap | S1)
+                
+                # State S2: Stored pattern (after swap)
+                swap_mask = self.state.get_action_mask(self.state.stored_pattern_idx)
+                model_mask_S2 = swap_mask.copy()
+                model_mask_S2[49] = False  # Can't swap back immediately in model
+                
+                probs_S2 = self.model_manager.get_d4_averaged_probs(
+                    self.state.board,
+                    self.state.stored_pattern_idx,
+                    self.selected_pattern_idx,
+                    action_mask=model_mask_S2,
+                )
+                swap_S2 = probs_S2[49]  # P(swap | S2) - should be 0 due to mask
+                
+                # Markov convergence
+                # r = P(S1→S2) × P(S2→S1) = swap_S1 × swap_S2
+                r = swap_S1 * swap_S2
+                
+                # Avoid division by zero (r is almost always < 1)
+                if r >= 0.999:
+                    r = 0.999
+                normalizer = 1.0 / (1.0 - r)
+                
+                # Final placement probabilities
+                # P_A(pos) = P(place A at pos) = (1 - swap_S1) × probs_S1[pos] × normalizer
+                # P_B(pos) = P(place B at pos) = swap_S1 × (1 - swap_S2) × probs_S2[pos] × normalizer
+                
+                probs = probs_S1.copy()
+                probs[:49] = (1.0 - swap_S1) * probs_S1[:49] * normalizer
+                probs[49] = 0  # Swap probability is now embedded in placement probs
+                
+                swap_probs = np.zeros(50)
+                swap_probs[:49] = swap_S1 * (1.0 - swap_S2) * probs_S2[:49] * normalizer
+                
+                self.current_probs = probs
                 self.current_swap_probs = swap_probs
             else:
+                # No stored pattern - just use current pattern probs
+                model_mask = self.state.get_model_action_mask(self.selected_pattern_idx)
+                probs = self.model_manager.get_d4_averaged_probs(
+                    self.state.board,
+                    self.selected_pattern_idx,
+                    self.state.stored_pattern_idx,
+                    action_mask=model_mask,
+                )
+                self.current_probs = probs
                 self.current_swap_probs = None
         else:
             self.current_probs = None
@@ -1355,21 +1420,16 @@ class BingoGUI(QMainWindow):
         if self.state.allow_store:
             self.stored_pattern_widget.set_pattern(self.state.stored_pattern_idx)
             
-            # Update store button
+            # Update store button (no probability display - it's embedded in placement probs)
             if self.selected_pattern_idx is not None and action_mask is not None:
                 can_store = action_mask[49]
                 if can_store:
-                    # Show store probability on button
-                    self.store_btn.setText(f"보관/교환 ({store_prob*100:.1f}%)")
-                    self.store_btn.setEnabled(True)
-                    
-                    # Highlight button if store is recommended (high probability)
-                    if store_prob >= 0.5:
-                        self.store_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-                    elif store_prob >= 0.3:
-                        self.store_btn.setStyleSheet("background-color: #8BC34A;")
+                    if self.state.stored_pattern_idx >= 0:
+                        self.store_btn.setText("교환")
                     else:
-                        self.store_btn.setStyleSheet("")
+                        self.store_btn.setText("보관")
+                    self.store_btn.setEnabled(True)
+                    self.store_btn.setStyleSheet("")
                 else:
                     self.store_btn.setText("보관/교환 (불가)")
                     self.store_btn.setEnabled(False)

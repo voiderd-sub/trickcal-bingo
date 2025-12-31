@@ -42,7 +42,7 @@ excludes = [
     'matplotlib',
     'PIL',
     'tkinter',
-    'unittest',
+    # 'unittest',  # PyTorch uses unittest.mock internally
     'test',
     'tests',
 ]
