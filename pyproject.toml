@@ -10,6 +10,8 @@ dependencies = [
     "gymnasium",
     "numpy",
     "pyside6",
+    "wandb>=0.23.1",
+    "tensorboard>=2.20.0",
 ]
 
 [[tool.uv.index]]

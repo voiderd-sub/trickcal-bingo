@@ -1,0 +1,64 @@
+# Bingo RL Training Configuration
+
+# Environment settings
+env:
+  size: 7
+  num_envs: 32768  # 32K envs for maximum GPU utilization
+  use_augmentation: true
+  use_gpu_env: true  # Use GPU-accelerated vectorized environment
+  allow_store: true  # Set to false to disable pattern storage
+
+# PPO hyperparameters
+# Rollout buffer: 32768 * 32 = 1,048,576 samples
+# Minibatches per epoch: 1,048,576 / 8,192 = 128
+# Total updates per rollout: 128 * 1 = 128
+ppo:
+  learning_rate: 1.0e-4  # Starting LR (will decay linearly to 0)
+  n_steps: 32  # Short rollouts (bingo max ~49 steps)
+  batch_size: 8192  # Larger batch for stable gradients
+  n_epochs: 1  # Minimal epochs (fast sampling = fresh data)
+  gamma: 0.99
+  gae_lambda: 0.95
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  clip_range: 0.2
+
+# Policy network architecture
+policy:
+  hidden_channels: 64
+  num_res_blocks: 3
+  kernel_size: 3
+  scalar_embed_dim: 32
+  features_dim: 256
+  pi_layers: [256, 128]
+  vf_layers: [256, 128]
+
+# Curriculum Learning settings (LINEAR)
+# Starts with (initial_min, initial_max) turns, linearly decreases to (0, 0)
+# Last full_training_ratio of training is full game (0, 0)
+curriculum:
+  enabled: true
+  initial_min: 10  # Starting min turns
+  initial_max: 20  # Starting max turns
+  full_training_ratio: 0.5  # Last 50% is full game
+
+# Training settings
+training:
+  total_timesteps: 200_000_000  # 200M for full convergence
+  device: "cuda"
+  save_path: "model/best_model"
+  final_model_path: "model/last_model"
+
+# Evaluation settings
+eval:
+  num_envs: 512  # Many parallel envs for fast eval
+  num_episodes: 50000  # 50K episodes for high statistical confidence
+  freq: 2_000_000  # 200M / 2M = 100 evaluations
+
+# Weights & Biases logging
+wandb:
+  enabled: true
+  project: "Trickcal-Bingo"
+  entity: "voider-private"
+  name: "Trickcal-Bingo-GPU-v2"

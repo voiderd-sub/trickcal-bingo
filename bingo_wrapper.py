@@ -1,186 +1,277 @@
-import gymnasium as gym
+"""
+SB3-Compatible VecEnv Wrapper for GPU-Accelerated Bingo Environment.
+
+Wraps BingoEnvGPU to provide stable-baselines3 VecEnv interface.
+Handles GPU tensor to numpy conversion for SB3 compatibility.
+"""
+
+import torch
 import numpy as np
+from gymnasium import spaces
+from stable_baselines3.common.vec_env.base_vec_env import VecEnv, VecEnvObs, VecEnvStepReturn
+from typing import Optional, List, Union, Tuple, Dict, Any
+
+from bingo_env import BingoEnvGPU
 
 
-class D4AugmentationWrapper(gym.Wrapper):
+class BingoVecEnvGPU(VecEnv):
     """
-    D4 대칭 증강 Wrapper.
+    SB3-compatible VecEnv wrapper for GPU-based BingoEnv.
     
-    매 step마다 랜덤 D4 변환 (8-fold: 4회전 × 2반사)을 적용하여
-    에이전트가 대칭적 정책을 학습하도록 함.
-    
-    원리:
-    - 관측을 변환하여 에이전트에 전달
-    - 에이전트의 action을 역변환하여 실제 환경에 적용
-    - 8배 샘플 효율 달성
+    All environment logic runs on GPU, with numpy conversion only at the boundary
+    for SB3 compatibility.
     """
     
-    def __init__(self, env):
-        super().__init__(env)
-        self.board_size = env.board_size
-        self.transform_idx = 0
+    def __init__(
+        self,
+        num_envs: int,
+        device: str = 'cuda',
+        use_augmentation: bool = True,
+    ):
+        self.gpu_env = BingoEnvGPU(
+            num_envs=num_envs,
+            device=device,
+            use_augmentation=use_augmentation,
+        )
+        self.device = torch.device(device)
+        self._num_envs = num_envs
         
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        self.transform_idx = np.random.randint(8)
-        return self._transform_obs(obs), info
+        # Pending actions for step_async/step_wait pattern
+        self._actions: Optional[torch.Tensor] = None
+        
+        # Define observation and action spaces
+        observation_space = spaces.Dict({
+            "board": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
+            "pattern": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
+            "stored_pattern": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
+            "has_stored": spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
+            "cost": spaces.Box(low=0.0, high=10.0, shape=(), dtype=np.float32),
+            "action_mask": spaces.Box(0, 1, shape=(50,), dtype=np.uint8),
+        })
+        
+        action_space = spaces.Discrete(50)  # 49 positions + 1 store
+        
+        super().__init__(num_envs, observation_space, action_space)
     
-    def step(self, action):
-        # 에이전트의 action을 역변환하여 실제 action 계산
-        real_action = self._inverse_transform_action(action)
-        
-        obs, reward, terminated, truncated, info = self.env.step(real_action)
-        
-        # 새로운 랜덤 변환 선택 (매 step)
-        self.transform_idx = np.random.randint(8)
-        
-        return self._transform_obs(obs), reward, terminated, truncated, info
-    
-    def _transform_obs(self, obs):
-        """관측 전체를 변환"""
-        transformed = {}
-        
-        for key, value in obs.items():
-            if key in ("board", "pattern", "stored_pattern"):
-                transformed[key] = self._transform_board(value)
-            elif key == "action_mask":
-                transformed[key] = self._transform_action_mask(value)
-            else:
-                transformed[key] = value
-        
-        return transformed
-    
-    def _transform_board(self, board):
-        """2D 보드를 D4 변환"""
-        return self._apply_d4(board, self.transform_idx)
-    
-    def _transform_action_mask(self, mask):
-        """Action mask를 D4 변환 (마지막 store action 제외)"""
-        board_size = self.board_size
-        position_mask = mask[:-1].reshape(board_size, board_size)
-        transformed_position_mask = self._apply_d4(position_mask, self.transform_idx)
-        store_mask = mask[-1:]
-        return np.concatenate([transformed_position_mask.flatten(), store_mask])
-    
-    def _inverse_transform_action(self, action):
-        """변환된 공간의 action을 원래 공간으로 역변환"""
-        board_size = self.board_size
-        store_action = board_size * board_size
-        
-        if action == store_action:
-            return action
-        
-        # Position action -> 2D coordinate
-        row, col = divmod(action, board_size)
-        
-        # 역변환 적용 (inverse of transform_idx)
-        inv_idx = self._inverse_transform_idx(self.transform_idx)
-        new_row, new_col = self._transform_point(row, col, inv_idx, board_size)
-        
-        return new_row * board_size + new_col
-    
-    @staticmethod
-    def _apply_d4(arr, transform_idx):
+    def step_async(self, actions: np.ndarray) -> None:
         """
-        D4 변환 적용.
+        Store actions for later execution.
         
-        0: identity
-        1: rot90 (반시계)
-        2: rot180
-        3: rot270
-        4: flip horizontal
-        5: flip horizontal + rot90
-        6: flip horizontal + rot180  
-        7: flip horizontal + rot270
+        Args:
+            actions: (num_envs,) numpy array of actions
         """
-        if transform_idx == 0:
-            return arr.copy()
-        elif transform_idx == 1:
-            return np.rot90(arr, 1)
-        elif transform_idx == 2:
-            return np.rot90(arr, 2)
-        elif transform_idx == 3:
-            return np.rot90(arr, 3)
-        elif transform_idx == 4:
-            return np.fliplr(arr).copy()
-        elif transform_idx == 5:
-            return np.rot90(np.fliplr(arr), 1)
-        elif transform_idx == 6:
-            return np.rot90(np.fliplr(arr), 2)
-        elif transform_idx == 7:
-            return np.rot90(np.fliplr(arr), 3)
-        else:
-            raise ValueError(f"Invalid transform_idx: {transform_idx}")
+        self._actions = torch.as_tensor(actions, dtype=torch.int64, device=self.device)
     
-    @staticmethod
-    def _inverse_transform_idx(transform_idx):
-        """D4 변환의 역변환 인덱스"""
-        # D4 군의 역원
-        # 0->0, 1->3, 2->2, 3->1, 4->4, 5->7, 6->6, 7->5
-        inverse_map = {0: 0, 1: 3, 2: 2, 3: 1, 4: 4, 5: 7, 6: 6, 7: 5}
-        return inverse_map[transform_idx]
-    
-    @staticmethod
-    def _transform_point(row, col, transform_idx, size):
+    def step_wait(self) -> VecEnvStepReturn:
         """
-        (row, col) 좌표를 D4 변환.
-        size: 보드 크기 (7)
-        """
-        n = size - 1
+        Execute stored actions and return results.
         
-        if transform_idx == 0:
-            return row, col
-        elif transform_idx == 1:  # rot90 반시계
-            return col, n - row
-        elif transform_idx == 2:  # rot180
-            return n - row, n - col
-        elif transform_idx == 3:  # rot270 반시계 = rot90 시계
-            return n - col, row
-        elif transform_idx == 4:  # flip horizontal
-            return row, n - col
-        elif transform_idx == 5:  # flip + rot90
-            return col, row
-        elif transform_idx == 6:  # flip + rot180
-            return n - row, col
-        elif transform_idx == 7:  # flip + rot270
-            return n - col, n - row
-        else:
-            raise ValueError(f"Invalid transform_idx: {transform_idx}")
+        Returns:
+            Tuple of (observations, rewards, dones, infos)
+        """
+        assert self._actions is not None, "Must call step_async before step_wait"
+        
+        # Execute on GPU
+        obs_gpu, rewards_gpu, dones_gpu, truncated_gpu, _ = self.gpu_env.step(self._actions)
+        
+        # Convert to numpy for SB3
+        obs = self._obs_to_numpy(obs_gpu)
+        rewards = rewards_gpu.cpu().numpy()
+        dones = dones_gpu.cpu().numpy()
+        
+        # Create infos list (SB3 expects list of dicts)
+        infos = [{} for _ in range(self.num_envs)]
+        
+        # Handle terminal observations (for VecEnv reset behavior)
+        # Note: BingoEnvGPU already auto-resets, so terminal_observation is the NEW obs
+        # We need to store the pre-reset observation for environments that terminated
+        # For now, we skip this as it's complex with auto-reset
+        
+        self._actions = None
+        return obs, rewards, dones, infos
+    
+    def reset(self) -> VecEnvObs:
+        """
+        Reset all environments.
+        
+        Returns:
+            Initial observations as numpy arrays
+        """
+        obs_gpu = self.gpu_env.reset()
+        return self._obs_to_numpy(obs_gpu)
+    
+    def close(self) -> None:
+        """Clean up resources."""
+        pass  # GPU env doesn't need explicit cleanup
+    
+    def get_attr(self, attr_name: str, indices: Optional[List[int]] = None) -> List[Any]:
+        """Get attribute from environments."""
+        if hasattr(self.gpu_env, attr_name):
+            return [getattr(self.gpu_env, attr_name)] * self.num_envs
+        return [None] * self.num_envs
+    
+    def set_attr(self, attr_name: str, value: Any, indices: Optional[List[int]] = None) -> None:
+        """Set attribute on environments."""
+        if hasattr(self.gpu_env, attr_name):
+            setattr(self.gpu_env, attr_name, value)
+    
+    def env_method(
+        self,
+        method_name: str,
+        *method_args,
+        indices: Optional[List[int]] = None,
+        **method_kwargs
+    ) -> List[Any]:
+        """
+        Call method on environments.
+        
+        Special handling for SB3 compatibility.
+        Note: SB3 calls env_method("action_masks") and expects a list of numpy arrays.
+        """
+        if method_name == "set_curriculum":
+            # set_curriculum(min_turns, max_turns)
+            if len(method_args) >= 2:
+                self.gpu_env.set_curriculum(method_args[0], method_args[1])
+            return [None] * self.num_envs
+        
+        if method_name == "action_masks":
+            # SB3 expects list of individual mask arrays, one per env
+            # Then it does np.stack() on them
+            masks_gpu = self.gpu_env.action_masks()
+            masks_np = masks_gpu.cpu().numpy()  # (num_envs, 50)
+            # Return as list of arrays (one per env)
+            return [masks_np[i] for i in range(self.num_envs)]
+        
+        if hasattr(self.gpu_env, method_name):
+            method = getattr(self.gpu_env, method_name)
+            result = method(*method_args, **method_kwargs)
+            # Convert tensor results to numpy
+            if isinstance(result, torch.Tensor):
+                result = result.cpu().numpy()
+            return [result] * self.num_envs
+        
+        return [None] * self.num_envs
+    
+    def env_is_wrapped(self, wrapper_class, indices: Optional[List[int]] = None) -> List[bool]:
+        """Check if environments are wrapped."""
+        return [False] * self.num_envs
+    
+    def seed(self, seed: Optional[int] = None) -> List[Optional[int]]:
+        """Set random seed."""
+        if seed is not None:
+            torch.manual_seed(seed)
+        return [seed] * self.num_envs
+    
+    def _obs_to_numpy(self, obs_gpu: Dict[str, torch.Tensor]) -> Dict[str, np.ndarray]:
+        """Convert GPU observation tensors to numpy arrays."""
+        return {
+            key: val.cpu().numpy() for key, val in obs_gpu.items()
+        }
+    
+    # === MaskablePPO support ===
+    
+    def action_masks(self) -> np.ndarray:
+        """
+        Get action masks for all environments.
+        
+        Returns:
+            (num_envs, 50) boolean numpy array
+        """
+        masks_gpu = self.gpu_env.action_masks()
+        return masks_gpu.cpu().numpy().astype(bool)
+    
+    def get_action_mask(self) -> np.ndarray:
+        """Alias for action_masks (some SB3 versions use this)."""
+        return self.action_masks()
+
+
+# Custom VecMonitor-like wrapper that keeps GPU tensors
+class BingoVecEnvGPUTensor(BingoVecEnvGPU):
+    """
+    GPU VecEnv that returns tensors instead of numpy.
+    
+    Use this for custom training loops that don't need numpy conversion.
+    Note: Not compatible with standard SB3 training!
+    """
+    
+    def step_wait(self) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, List[Dict]]:
+        """Execute step and return GPU tensors directly."""
+        assert self._actions is not None
+        
+        obs, rewards, dones, truncated, _ = self.gpu_env.step(self._actions)
+        infos = [{} for _ in range(self.num_envs)]
+        
+        self._actions = None
+        return obs, rewards, dones, infos
+    
+    def reset(self) -> Dict[str, torch.Tensor]:
+        """Reset and return GPU tensors directly."""
+        return self.gpu_env.reset()
+    
+    def action_masks(self) -> torch.Tensor:
+        """Return action masks as GPU tensor."""
+        return self.gpu_env.action_masks()
 
 
 if __name__ == "__main__":
-    from bingo_env import BingoEnv
+    import time
     
-    # 테스트
-    env = BingoEnv(7)
-    wrapped_env = D4AugmentationWrapper(env)
+    print("=== BingoVecEnvGPU Test ===")
     
-    print("=== D4 Wrapper Test ===")
-    obs, _ = wrapped_env.reset()
-    print(f"Transform idx: {wrapped_env.transform_idx}")
+    # Test SB3 compatibility
+    num_envs = 256
+    env = BingoVecEnvGPU(num_envs=num_envs, device='cuda', use_augmentation=True)
     
-    # 몇 스텝 실행
-    for i in range(5):
-        mask = obs["action_mask"]
-        valid_actions = np.where(mask == 1)[0]
-        if len(valid_actions) == 0:
-            break
-        action = np.random.choice(valid_actions)
-        obs, reward, done, truncated, info = wrapped_env.step(action)
-        print(f"Step {i+1}: action={action}, transform={wrapped_env.transform_idx}, reward={reward:.2f}")
-        if done:
-            break
+    print(f"Created VecEnv with {num_envs} environments")
+    print(f"Observation space: {env.observation_space}")
+    print(f"Action space: {env.action_space}")
     
-    # 변환 정확성 테스트
-    print("\n=== Transform Correctness Test ===")
-    test_board = np.zeros((7, 7), dtype=np.int8)
-    test_board[0, 0] = 1  # 좌상단
-    test_board[6, 6] = 1  # 우하단
+    # Test reset
+    obs = env.reset()
+    print(f"\nReset successful!")
+    print(f"  board shape: {obs['board'].shape}, dtype: {obs['board'].dtype}")
+    print(f"  action_mask shape: {obs['action_mask'].shape}")
     
-    for t_idx in range(8):
-        transformed = D4AugmentationWrapper._apply_d4(test_board, t_idx)
-        inv_idx = D4AugmentationWrapper._inverse_transform_idx(t_idx)
-        restored = D4AugmentationWrapper._apply_d4(transformed, inv_idx)
-        
-        is_identical = np.array_equal(test_board, restored)
-        print(f"Transform {t_idx}: inverse={inv_idx}, restored={is_identical}")
+    # Test step
+    masks = env.action_masks()
+    print(f"  action_masks shape: {masks.shape}, dtype: {masks.dtype}")
+    
+    # Sample valid actions
+    actions = np.array([
+        np.random.choice(np.where(m)[0]) for m in masks
+    ])
+    
+    env.step_async(actions)
+    obs, rewards, dones, infos = env.step_wait()
+    
+    print(f"\nStep successful!")
+    print(f"  rewards: min={rewards.min():.2f}, max={rewards.max():.2f}")
+    print(f"  dones: {dones.sum()} environments done")
+    
+    # Benchmark
+    print("\nBenchmarking...")
+    env.reset()
+    
+    start = time.time()
+    n_iters = 1000
+    
+    for _ in range(n_iters):
+        masks = env.action_masks()
+        actions = np.array([np.random.choice(np.where(m)[0]) for m in masks])
+        env.step_async(actions)
+        obs, rewards, dones, infos = env.step_wait()
+    
+    elapsed = time.time() - start
+    fps = (n_iters * num_envs) / elapsed
+    
+    print(f"FPS: {fps:,.0f}")
+    print(f"Note: numpy action sampling is slow. Real training uses policy network.")
+    
+    # Test curriculum
+    print("\nTesting curriculum...")
+    env.env_method("set_curriculum", 5, 10)
+    obs = env.reset()
+    print("Curriculum set to (5, 10) - boards should be partially filled")
+    
+    env.close()
+    print("\nAll tests passed!")

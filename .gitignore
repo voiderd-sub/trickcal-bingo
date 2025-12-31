@@ -6,3 +6,5 @@ test.py
 log*
 
 bingo_log.json
+wandb
+runs

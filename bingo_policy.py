@@ -85,9 +85,9 @@ class BingoCNNExtractor(BaseFeaturesExtractor):
         self.global_pool = nn.AdaptiveAvgPool2d(1)
 
         # Scalar feature embedding
-        # has_stored: 0 or 1, store_remaining: 0, 1, 2
+        # has_stored: 0 or 1
         self.scalar_fc = nn.Sequential(
-            nn.Linear(2, scalar_embed_dim),
+            nn.Linear(1, scalar_embed_dim),
             nn.GELU(),
             nn.Linear(scalar_embed_dim, scalar_embed_dim),
             nn.GELU()
@@ -119,7 +119,6 @@ class BingoCNNExtractor(BaseFeaturesExtractor):
         stored_pattern = observations["stored_pattern"].float()
         # Scalar features are already shape (B, 1) from Box space
         has_stored = observations["has_stored"].float()
-        store_remaining = observations["store_remaining"].float()
 
         # Stack as 3 channels: (B, 3, H, W)
         x = torch.stack([board, pattern, stored_pattern], dim=1)
@@ -131,8 +130,7 @@ class BingoCNNExtractor(BaseFeaturesExtractor):
         x = x.flatten(start_dim=1)  # (B, hidden_channels)
 
         # Scalar features
-        scalar_feats = torch.cat([has_stored, store_remaining], dim=1)
-        scalar_embed = self.scalar_fc(scalar_feats)
+        scalar_embed = self.scalar_fc(has_stored)
 
         # Combine and output
         combined = torch.cat([x, scalar_embed], dim=1)
