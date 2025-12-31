@@ -1,10 +1,11 @@
+# Trickcal Bingo Build Workflow
 name: Build Releases
 
 on:
   push:
     tags:
-      - 'v*'  # Trigger on version tags like v1.0.0
-  workflow_dispatch:  # Allow manual trigger
+      - 'v*'
+  workflow_dispatch:
 
 jobs:
   build-windows:
@@ -17,7 +18,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'  # 캐싱 활성화
+          cache: 'pip'
 
       - name: Cache pip packages
         uses: actions/cache@v4
@@ -30,12 +31,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pyinstaller
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install numpy pyside6 gymnasium pyyaml
 
       - name: Build executable
         run: |
-          pyinstaller trickcal_bingo.spec --noconfirm
+          python -m PyInstaller trickcal_bingo.spec --noconfirm
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -53,7 +55,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'  # 캐싱 활성화
+          cache: 'pip'
 
       - name: Cache pip packages
         uses: actions/cache@v4
@@ -66,11 +68,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller torch numpy pyside6 gymnasium pyyaml
+          pip install pyinstaller
+          pip install torch numpy pyside6 gymnasium pyyaml
 
       - name: Build app bundle
         run: |
-          pyinstaller trickcal_bingo.spec --noconfirm
+          python -m PyInstaller trickcal_bingo.spec --noconfirm
 
       - name: Create ZIP for macOS
         run: |
@@ -86,7 +89,7 @@ jobs:
   release:
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     permissions:
       contents: write
     steps:
@@ -105,7 +108,10 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: ${{ github.ref_name || format('build-{0}', github.run_number) }}
+          name: Release ${{ github.ref_name || github.run_number }}
           files: |
             windows/TrickcalBingo.exe
             macos/TrickcalBingo-macOS.zip
           generate_release_notes: true
+          prerelease: ${{ github.event_name == 'workflow_dispatch' }}
