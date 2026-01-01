@@ -108,8 +108,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.ref_name || format('build-{0}', github.run_number) }}
-          name: Release ${{ github.ref_name || github.run_number }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('build-{0}', github.run_number) }}
+          name: Release ${{ github.ref_type == 'tag' && github.ref_name || format('Build {0}', github.run_number) }}
           files: |
             windows/TrickcalBingo.exe
             macos/TrickcalBingo-macOS.zip

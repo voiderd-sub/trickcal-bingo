@@ -1036,14 +1036,21 @@ class BingoGUI(QMainWindow):
         if num_patterns == 1:
             new_patterns[0] = pattern_idx
         else:
-            # For 2-pattern mode: new pattern becomes current (0), old current moves to stored (1)
-            if new_patterns[0] < 0:
-                # First pattern selection
+            # Check if game is in progress (board has filled cells)
+            is_game_in_progress = np.sum(self.state.board) > 0
+            
+            if is_game_in_progress:
+                # In progress: only replace current pattern, keep stored pattern
                 new_patterns[0] = pattern_idx
             else:
-                # Push current to stored, new becomes current
-                new_patterns[1] = new_patterns[0]
-                new_patterns[0] = pattern_idx
+                # Not started: Queue behavior (new becomes current, old current moves to stored)
+                if new_patterns[0] < 0:
+                    # First pattern selection
+                    new_patterns[0] = pattern_idx
+                else:
+                    # Push current to stored, new becomes current
+                    new_patterns[1] = new_patterns[0]
+                    new_patterns[0] = pattern_idx
         
         self.state.set_patterns(new_patterns)
         self._update_display()
@@ -1223,6 +1230,22 @@ class BingoGUI(QMainWindow):
                 
                 if found_sorted_slot != -1:
                     probs[gui_slot*49 : (gui_slot+1)*49] = raw_probs[found_sorted_slot*49 : (found_sorted_slot+1)*49]
+                    
+                    # Simplify display for line patterns (center row/col only)
+                    # This avoids visual clutter since the effect is identical across the line
+                    slot_probs = probs[gui_slot*49 : (gui_slot+1)*49]
+                    if gui_pattern == 3:  # Horizontal line (1x7)
+                        # Keep only column 3 (center), clear others
+                        for r in range(7):
+                            for c in range(7):
+                                if c != 3:
+                                    slot_probs[r*7 + c] = 0
+                    elif gui_pattern == 4: # Vertical line (7x1)
+                        # Keep only row 3 (center), clear others
+                        for r in range(7):
+                            if r != 3:
+                                for c in range(7):
+                                    slot_probs[r*7 + c] = 0
             
             # Same-pattern merge: if both patterns are the same, sum probabilities
             if num_patterns >= 2 and self.state.pattern_indices[0] == self.state.pattern_indices[1]:
