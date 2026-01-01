@@ -43,7 +43,6 @@ class MaskablePPOPolicy(nn.Module):
         hidden_channels: int = 64,
         num_res_blocks: int = 3,
         kernel_size: int = 3,
-        pattern_embed_dim: int = 32,
         num_patterns: int = 1,
         pi_layers: list = [256, 128],
         vf_layers: list = [256, 128],
@@ -57,7 +56,6 @@ class MaskablePPOPolicy(nn.Module):
             hidden_channels=hidden_channels,
             num_res_blocks=num_res_blocks,
             kernel_size=kernel_size,
-            pattern_embed_dim=pattern_embed_dim,
             num_patterns=num_patterns,
         )
 
@@ -326,7 +324,8 @@ class PPOTrainer:
         from gymnasium import spaces
         obs_space = spaces.Dict({
             "board": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
-            "pattern_indices": spaces.Box(low=-1, high=4, shape=(self.num_patterns,), dtype=np.int64),
+            "pattern_0": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
+            "pattern_1": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
         })
         
         # Create policy
@@ -338,7 +337,6 @@ class PPOTrainer:
             hidden_channels=policy_cfg['hidden_channels'],
             num_res_blocks=policy_cfg['num_res_blocks'],
             kernel_size=policy_cfg['kernel_size'],
-            pattern_embed_dim=policy_cfg.get('pattern_embed_dim', 32),
             num_patterns=self.num_patterns,
             pi_layers=policy_cfg['pi_layers'],
             vf_layers=policy_cfg['vf_layers'],
@@ -356,7 +354,8 @@ class PPOTrainer:
         # Rollout buffer
         obs_shapes = {
             'board': (7, 7),
-            'pattern_indices': (self.num_patterns,),
+            'pattern_0': (7, 7),
+            'pattern_1': (7, 7),
         }
         self.buffer = RolloutBuffer(
             self.num_envs,
@@ -404,7 +403,8 @@ class PPOTrainer:
         """Prepare observation for policy (convert to float, exclude action_mask)."""
         return {
             'board': obs['board'].float(),
-            'pattern_indices': obs['pattern_indices'].long(),
+            'pattern_0': obs['pattern_0'].float(),
+            'pattern_1': obs['pattern_1'].float(),
         }
     
     def _update_curriculum(self, timestep: int):

@@ -1,13 +1,13 @@
 """
 Policy network for Bingo RL agent.
 
-Uses CNN for board state and embeddings for pattern indices.
-This is more efficient than encoding 5-class patterns as 7x7 images.
+Uses CNN with 3 channels: board + pattern_0 + pattern_1
+All three 7x7 grids go through the same CNN for spatial reasoning.
 
 Architecture:
-- Board: 7x7 → CNN → features (spatial understanding)
-- Patterns: indices → Embedding(5, dim) → concat per pattern
-- Combined features → MLP → policy/value heads
+- Input: 3 channels (board, pattern_0, pattern_1) as 7x7 grids
+- CNN with residual blocks
+- MLP heads for policy and value
 """
 
 import torch
@@ -57,10 +57,12 @@ class BingoCNNExtractor(nn.Module):
     
     Input:
         - board: (B, 7, 7) binary board state
-        - pattern_indices: (B, num_patterns) int64 pattern type indices (0-4, or -1 for empty)
+        - pattern_0: (B, 7, 7) first pattern (padded to 7x7)
+        - pattern_1: (B, 7, 7) second pattern (zeros if num_patterns=1)
     
-    Uses CNN only for board (spatial reasoning needed).
-    Uses embedding for patterns (only 5 types, no spatial info needed).
+    Stacks all three as channels and processes through CNN.
+    This allows the network to learn spatial relationships between
+    the board state and pattern shapes.
     """
     def __init__(
         self,
@@ -69,18 +71,15 @@ class BingoCNNExtractor(nn.Module):
         hidden_channels=64,
         num_res_blocks=3,
         kernel_size=3,
-        pattern_embed_dim=32,
-        num_pattern_types=5,
-        num_patterns=1,  # Can be any positive integer
+        num_patterns=1,  # For compatibility, not used in CNN approach
     ):
         super().__init__()
         self._features_dim = features_dim
         self.num_patterns = num_patterns
-        self.num_pattern_types = num_pattern_types
 
-        # Board CNN: single channel input (just the board)
+        # CNN: 3 channels (board + pattern_0 + pattern_1)
         self.initial_conv = nn.Sequential(
-            nn.Conv2d(1, hidden_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(3, hidden_channels, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(1, hidden_channels),
             nn.GELU()
         )
@@ -95,15 +94,9 @@ class BingoCNNExtractor(nn.Module):
         # Global average pooling
         self.global_pool = nn.AdaptiveAvgPool2d(1)
 
-        # Pattern embedding: index -> vector
-        # +1 for the "empty" pattern (index -1 mapped to num_pattern_types)
-        self.pattern_embedding = nn.Embedding(num_pattern_types + 1, pattern_embed_dim)
-        nn.init.orthogonal_(self.pattern_embedding.weight, gain=1.0)
-
-        # Final MLP: board features + all pattern embeddings
-        combined_dim = hidden_channels + (num_patterns * pattern_embed_dim)
+        # Final MLP
         self.final_fc = nn.Sequential(
-            nn.Linear(combined_dim, features_dim),
+            nn.Linear(hidden_channels, features_dim),
             nn.GELU(),
             nn.Linear(features_dim, features_dim),
             nn.GELU()
@@ -120,48 +113,37 @@ class BingoCNNExtractor(nn.Module):
         return self._features_dim
 
     def forward(self, observations):
-        # Board: (B, 7, 7) -> (B, 1, 7, 7)
-        board = observations["board"].float().unsqueeze(1)
+        # Get observations
+        board = observations["board"].float()          # (B, 7, 7)
+        pattern_0 = observations["pattern_0"].float()  # (B, 7, 7)
+        pattern_1 = observations["pattern_1"].float()  # (B, 7, 7)
         
-        # Pattern indices: (B, num_patterns) int64
-        pattern_indices = observations["pattern_indices"].long()
+        # Stack as 3 channels: (B, 3, 7, 7)
+        x = torch.stack([board, pattern_0, pattern_1], dim=1)
         
-        # Map -1 (empty) to num_pattern_types for embedding lookup
-        pattern_indices = torch.where(
-            pattern_indices < 0,
-            torch.full_like(pattern_indices, self.num_pattern_types),
-            pattern_indices
-        )
-        
-        # CNN for board
-        x = self.initial_conv(board)
+        # CNN
+        x = self.initial_conv(x)
         x = self.res_blocks(x)
         x = self.global_pool(x)
-        board_features = x.flatten(start_dim=1)  # (B, hidden_channels)
+        x = x.flatten(start_dim=1)  # (B, hidden_channels)
         
-        # Embed all patterns: (B, num_patterns) -> (B, num_patterns, embed_dim)
-        pattern_embeds = self.pattern_embedding(pattern_indices)
-        # Flatten: (B, num_patterns * embed_dim)
-        pattern_features = pattern_embeds.flatten(start_dim=1)
-        
-        # Combine and output
-        combined = torch.cat([board_features, pattern_features], dim=1)
-        return self.final_fc(combined)
+        return self.final_fc(x)
 
 
 if __name__ == "__main__":
     from gymnasium import spaces
     
-    print("=== BingoCNNExtractor Test (with Embedding) ===")
+    print("=== BingoCNNExtractor Test (CNN 3-channel) ===")
     
     # Test with different num_patterns
-    for num_patterns in [1, 2, 3, 5]:
+    for num_patterns in [1, 2]:
         print(f"\n--- num_patterns={num_patterns} ---")
         
-        # Observation space (simplified - pattern_indices instead of 7x7 grids)
+        # Observation space
         obs_space = spaces.Dict({
             "board": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
-            "pattern_indices": spaces.Box(low=-1, high=4, shape=(num_patterns,), dtype=np.int64),
+            "pattern_0": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
+            "pattern_1": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
         })
         
         extractor = BingoCNNExtractor(
@@ -177,7 +159,8 @@ if __name__ == "__main__":
         batch_size = 4
         dummy_obs = {
             "board": torch.zeros(batch_size, 7, 7),
-            "pattern_indices": torch.randint(-1, 5, (batch_size, num_patterns)),
+            "pattern_0": torch.zeros(batch_size, 7, 7),
+            "pattern_1": torch.zeros(batch_size, 7, 7),
         }
         
         output = extractor(dummy_obs)

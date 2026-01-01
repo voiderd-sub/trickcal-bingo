@@ -208,7 +208,6 @@ class MaskablePPOPolicy(nn.Module):
         hidden_channels: int = 64,
         num_res_blocks: int = 3,
         kernel_size: int = 3,
-        pattern_embed_dim: int = 32,
         num_patterns: int = 1,
         pi_layers: list = [256, 128],
         vf_layers: list = [256, 128],
@@ -221,7 +220,6 @@ class MaskablePPOPolicy(nn.Module):
             hidden_channels=hidden_channels,
             num_res_blocks=num_res_blocks,
             kernel_size=kernel_size,
-            pattern_embed_dim=pattern_embed_dim,
             num_patterns=num_patterns,
         )
         
@@ -443,7 +441,8 @@ class ModelManager:
         from gymnasium import spaces
         return spaces.Dict({
             "board": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
-            "pattern_indices": spaces.Box(low=-1, high=4, shape=(num_patterns,), dtype=np.int64),
+            "pattern_0": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
+            "pattern_1": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
         })
     
     def _create_policy(self, num_patterns: int) -> MaskablePPOPolicy:
@@ -457,7 +456,6 @@ class ModelManager:
             hidden_channels=64,
             num_res_blocks=3,
             kernel_size=3,
-            pattern_embed_dim=32,
             num_patterns=num_patterns,
             pi_layers=[256, 128],
             vf_layers=[256, 128],
@@ -527,19 +525,15 @@ class ModelManager:
         
         all_probs = []
         
-        # Convert pattern_indices to numpy array
-        pattern_indices_arr = np.array(pattern_indices[:num_patterns], dtype=np.int64)
-        if len(pattern_indices_arr) < num_patterns:
-            # Pad with -1 if needed
-            pattern_indices_arr = np.pad(
-                pattern_indices_arr, 
-                (0, num_patterns - len(pattern_indices_arr)),
-                constant_values=-1
-            )
+        # Get padded pattern observations
+        pattern_0_obs = self._get_pattern_obs(pattern_indices[0] if len(pattern_indices) > 0 else -1)
+        pattern_1_obs = self._get_pattern_obs(pattern_indices[1] if len(pattern_indices) > 1 else -1)
         
         for transform_idx in range(8):
-            # Transform board observation
+            # Transform observations
             transformed_board = transform_board(board, transform_idx)
+            transformed_pattern_0 = transform_board(pattern_0_obs, transform_idx)
+            transformed_pattern_1 = transform_board(pattern_1_obs, transform_idx)
             
             # Transform action mask
             transformed_mask = np.zeros(n_actions, dtype=bool)
@@ -552,7 +546,8 @@ class ModelManager:
             # Create observation tensors
             obs = {
                 'board': torch.from_numpy(transformed_board).float().unsqueeze(0),
-                'pattern_indices': torch.from_numpy(pattern_indices_arr).long().unsqueeze(0),
+                'pattern_0': torch.from_numpy(transformed_pattern_0).float().unsqueeze(0),
+                'pattern_1': torch.from_numpy(transformed_pattern_1).float().unsqueeze(0),
             }
             
             # Get logits
@@ -584,6 +579,17 @@ class ModelManager:
             normalized_probs = averaged_probs
         
         return normalized_probs
+    
+    def _get_pattern_obs(self, pattern_idx: int) -> np.ndarray:
+        """Get 7x7 padded pattern observation."""
+        if pattern_idx < 0:
+            return np.zeros((7, 7), dtype=np.int8)
+        pattern = PATTERNS[pattern_idx]
+        padded = np.zeros((7, 7), dtype=np.int8)
+        ph, pw = pattern.shape
+        oh, ow = (7 - ph) // 2, (7 - pw) // 2
+        padded[oh:oh+ph, ow:ow+pw] = pattern
+        return padded
 
 
 # =============================================================================

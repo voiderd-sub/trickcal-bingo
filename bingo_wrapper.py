@@ -48,7 +48,8 @@ class BingoVecEnvGPU(VecEnv):
         # Define observation and action spaces
         observation_space = spaces.Dict({
             "board": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
-            "pattern_indices": spaces.Box(low=-1, high=4, shape=(num_patterns,), dtype=np.int64),
+            "pattern_0": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
+            "pattern_1": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
             "action_mask": spaces.Box(0, 1, shape=(self.n_actions,), dtype=np.uint8),
         })
         

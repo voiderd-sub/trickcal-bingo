@@ -496,7 +496,8 @@ class BingoEnvGPU:
         Returns:
             Dictionary with GPU tensors:
             - board: (num_envs, 7, 7) int8 - current board state
-            - pattern_indices: (num_envs, num_patterns) int64 - pattern type indices (0-4)
+            - pattern_0: (num_envs, 7, 7) int8 - first pattern (padded)
+            - pattern_1: (num_envs, 7, 7) int8 - second pattern (zeros if num_patterns=1)
             - action_mask: (num_envs, n_actions) uint8
         """
         # Convert bitboard to 7x7 array: (num_envs, 7, 7)
@@ -504,9 +505,20 @@ class BingoEnvGPU:
             self.num_envs, 7, 7
         ).to(torch.int8)
         
-        # Apply D4 transform to board
+        # Pattern 0: (num_envs, 7, 7)
+        pattern_0 = self.obs_patterns[self.pattern_indices[:, 0]]
+        
+        # Pattern 1: (num_envs, 7, 7) - zeros if num_patterns=1
+        if self.num_patterns >= 2:
+            pattern_1 = self.obs_patterns[self.pattern_indices[:, 1]]
+        else:
+            pattern_1 = torch.zeros(self.num_envs, 7, 7, dtype=torch.int8, device=self.device)
+        
+        # Apply D4 transforms
         if self.use_augmentation:
             board_arr = self._transform_boards(board_arr)
+            pattern_0 = self._transform_boards(pattern_0)
+            pattern_1 = self._transform_boards(pattern_1)
         
         # Use cached action mask if available, otherwise compute
         if self._cached_action_mask is not None:
@@ -516,7 +528,8 @@ class BingoEnvGPU:
         
         return {
             "board": board_arr,
-            "pattern_indices": self.pattern_indices.clone(),
+            "pattern_0": pattern_0,
+            "pattern_1": pattern_1,
             "action_mask": action_mask.to(torch.uint8),
         }
     
