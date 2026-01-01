@@ -18,14 +18,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QListWidget, QListWidgetItem, QGroupBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
     QAbstractItemView,
 )
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QColor, QPainter, QPixmap
+from PySide6.QtCore import Qt, QSize
+from PySide6.QtGui import QColor, QPainter, QPixmap
 
 from bingo_policy import BingoCNNExtractor
 
@@ -333,9 +333,12 @@ class BingoState:
         
         self._apply_pattern(pattern_idx, row, col)
         
-        # Clear the used slot (will be refilled by next pattern selection)
-        self.pattern_indices[slot] = -1
-        self._sort_patterns()
+        # After using a pattern: move remaining to stored (slot 1), clear current (slot 0)
+        if self.num_patterns == 2:
+            remaining = self.pattern_indices[1 - slot]  # The other slot
+            self.pattern_indices = [-1, remaining]  # current empty, stored has remaining
+        else:
+            self.pattern_indices[slot] = -1
     
     def _apply_pattern(self, pattern_idx: int, center_row: int, center_col: int):
         """Apply pattern to board at center position."""
@@ -359,13 +362,9 @@ class BingoState:
         self._sort_patterns()
     
     def _sort_patterns(self):
-        """Sort pattern indices for canonical state (when num_patterns=2)."""
-        if self.num_patterns == 2:
-            # Sort valid patterns, keep -1 at the end
-            valid = [p for p in self.pattern_indices if p >= 0]
-            invalid = [p for p in self.pattern_indices if p < 0]
-            valid.sort()
-            self.pattern_indices = valid + invalid
+        """Sort pattern indices for canonical state - not used in GUI mode."""
+        # GUI mode doesn't sort - slot 0 = current, slot 1 = stored
+        pass
     
     def save_state(self):
         """Save current state to history."""
@@ -646,6 +645,25 @@ class BoardWidget(QTableWidget):
         - probs[0:49] = pattern 0 probabilities (blue)
         - probs[49:98] = pattern 1 probabilities (green)
         """
+        # Calculate rankings
+        rank_map = {}
+        if probs is not None:
+            all_valid_probs = []
+            for i in range(49):
+                prob_0 = probs[i] if len(probs) > i else 0
+                prob_1 = probs[49+i] if num_patterns >= 2 and len(probs) > 49+i else 0
+                
+                mask_0 = action_mask is not None and len(action_mask) > i and action_mask[i]
+                mask_1 = action_mask is not None and num_patterns >= 2 and len(action_mask) > 49+i and action_mask[49+i]
+                
+                if mask_0 and prob_0 >= threshold:
+                    all_valid_probs.append(round(prob_0, 4))
+                if mask_1 and prob_1 >= threshold:
+                    all_valid_probs.append(round(prob_1, 4))
+            
+            unique_probs = sorted(list(set(all_valid_probs)), reverse=True)
+            rank_map = {p: i+1 for i, p in enumerate(unique_probs)}
+
         for i in range(7):
             for j in range(7):
                 item = self.item(i, j)
@@ -661,24 +679,30 @@ class BoardWidget(QTableWidget):
                 has_prob_0 = mask_0 and prob_0 >= threshold
                 has_prob_1 = mask_1 and prob_1 >= threshold
                 
+                rank0 = rank_map.get(round(prob_0, 4)) if has_prob_0 else None
+                rank1 = rank_map.get(round(prob_1, 4)) if has_prob_1 else None
+                
+                text = ""
+                
                 if board[i, j] == 1:
                     # Filled cell
                     if has_prob_0 or has_prob_1:
                         max_prob = max(prob_0 if has_prob_0 else 0, prob_1 if has_prob_1 else 0)
                         intensity = min(max_prob / 0.5, 1.0)
-                        lightness = 0.35 - intensity * 0.15
+                        lightness = 0.9 - intensity * 0.5
                         if has_prob_0 and has_prob_1:
-                            color = QColor.fromHslF(0.8, 0.6, lightness)  # Purple
-                            item.setText(f"{prob_0*100:.0f}|{prob_1*100:.0f}")
+                            color = QColor.fromHslF(0.8, 0.7, lightness)  # Purple
+                            text = f"[{rank0}]{prob_0*100:.0f}%\n[{rank1}]{prob_1*100:.0f}%"
                         elif has_prob_0:
                             color = QColor.fromHslF(0.6, 0.6, lightness)  # Blue
-                            item.setText(f"{prob_0*100:.0f}%")
+                            text = f"[{rank0}] {prob_0*100:.0f}%"
                         else:
                             color = QColor.fromHslF(0.35, 0.6, lightness)  # Green
-                            item.setText(f"{prob_1*100:.0f}%")
+                            text = f"[{rank1}] {prob_1*100:.0f}%"
                         item.setBackground(color)
                         item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                         item.setForeground(QColor("white"))
+                        item.setText(text)
                     else:
                         item.setBackground(QColor("#555555"))
                         item.setText("")
@@ -689,7 +713,7 @@ class BoardWidget(QTableWidget):
                     lightness = 0.9 - intensity * 0.5
                     color = QColor.fromHslF(0.8, 0.7, lightness)  # Purple
                     item.setBackground(color)
-                    item.setText(f"{prob_0*100:.0f}|{prob_1*100:.0f}")
+                    item.setText(f"[{rank0}]{prob_0*100:.0f}%\n[{rank1}]{prob_1*100:.0f}%")
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     item.setForeground(QColor("white") if lightness < 0.5 else QColor("black"))
                 elif has_prob_0:
@@ -698,7 +722,7 @@ class BoardWidget(QTableWidget):
                     lightness = 0.9 - intensity * 0.5
                     color = QColor.fromHslF(0.6, 0.8, lightness)
                     item.setBackground(color)
-                    item.setText(f"{prob_0*100:.0f}%")
+                    item.setText(f"[{rank0}] {prob_0*100:.0f}%")
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     item.setForeground(QColor("white") if lightness < 0.5 else QColor("black"))
                 elif has_prob_1:
@@ -707,7 +731,7 @@ class BoardWidget(QTableWidget):
                     lightness = 0.9 - intensity * 0.5
                     color = QColor.fromHslF(0.35, 0.8, lightness)
                     item.setBackground(color)
-                    item.setText(f"{prob_1*100:.0f}%")
+                    item.setText(f"[{rank1}] {prob_1*100:.0f}%")
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     item.setForeground(QColor("white") if lightness < 0.5 else QColor("black"))
                 else:
@@ -840,6 +864,10 @@ class BingoGUI(QMainWindow):
         self._setup_ui()
         self._try_load_saved_state()
         self._update_display()
+        
+        # Right-click anywhere for auto-place
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_right_click)
     
     def _setup_ui(self):
         central = QWidget()
@@ -893,21 +921,37 @@ class BingoGUI(QMainWindow):
         
         # Current patterns group
         patterns_group = QGroupBox("현재 패턴")
-        patterns_layout = QVBoxLayout(patterns_group)
+        patterns_layout = QHBoxLayout(patterns_group)
         
-        # Pattern displays
-        pattern_display_layout = QHBoxLayout()
-        
+        # Pattern 0 container (label above image)
+        pattern_0_container = QVBoxLayout()
+        self.pattern_label_0 = QLabel("현재 패턴")
+        self.pattern_label_0.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pattern_display_0 = PatternDisplayWidget(0)
+        pattern_0_container.addWidget(self.pattern_label_0, 0, Qt.AlignmentFlag.AlignCenter)
+        pattern_0_container.addWidget(self.pattern_display_0, 0, Qt.AlignmentFlag.AlignCenter)
+        self.pattern_0_container_widget = QWidget()
+        self.pattern_0_container_widget.setLayout(pattern_0_container)
+        patterns_layout.addWidget(self.pattern_0_container_widget)
+        
+        # Pattern 1 container (label above image)
+        pattern_1_container = QVBoxLayout()
+        self.pattern_label_1 = QLabel("저장된 패턴")
+        self.pattern_label_1.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pattern_display_1 = PatternDisplayWidget(1)
+        pattern_1_container.addWidget(self.pattern_label_1, 0, Qt.AlignmentFlag.AlignCenter)
+        pattern_1_container.addWidget(self.pattern_display_1, 0, Qt.AlignmentFlag.AlignCenter)
+        self.pattern_1_container_widget = QWidget()
+        self.pattern_1_container_widget.setLayout(pattern_1_container)
         
-        pattern_display_layout.addWidget(QLabel("패턴 0:"))
-        pattern_display_layout.addWidget(self.pattern_display_0)
-        pattern_display_layout.addWidget(QLabel("패턴 1:"))
-        pattern_display_layout.addWidget(self.pattern_display_1)
-        pattern_display_layout.addStretch()
+        # Retain size when hidden to prevent layout shift
+        sp = self.pattern_1_container_widget.sizePolicy()
+        sp.setRetainSizeWhenHidden(True)
+        self.pattern_1_container_widget.setSizePolicy(sp)
         
-        patterns_layout.addLayout(pattern_display_layout)
+        patterns_layout.addWidget(self.pattern_1_container_widget)
+        
+        patterns_layout.addStretch()
         
         right_layout.addWidget(patterns_group)
         
@@ -921,16 +965,21 @@ class BingoGUI(QMainWindow):
         self.filled_label = QLabel("채워진 칸: 0 / 49")
         info_layout.addWidget(self.filled_label)
         
+        # Status label for 2-pattern mode
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #d32f2f; font-weight: bold;")
+        info_layout.addWidget(self.status_label)
+        
         right_layout.addWidget(info_group)
         
         # Action buttons
         action_group = QGroupBox("동작")
         action_layout = QVBoxLayout(action_group)
         
-        self.auto_place_btn = QPushButton("최적 위치에 자동 배치")
-        self.auto_place_btn.clicked.connect(self._on_auto_place)
-        self.auto_place_btn.setEnabled(False)
-        action_layout.addWidget(self.auto_place_btn)
+        self.swap_btn = QPushButton("패턴 교환")
+        self.swap_btn.clicked.connect(self._on_swap_patterns)
+        self.swap_btn.setEnabled(False)
+        action_layout.addWidget(self.swap_btn)
         
         self.undo_btn = QPushButton("이전으로")
         self.undo_btn.clicked.connect(self._on_undo)
@@ -947,9 +996,9 @@ class BingoGUI(QMainWindow):
             "■ 확률 10% 이상인 위치만 표시됩니다.\n"
             "■ 색이 진할수록 높은 확률입니다.\n\n"
             "색상 안내:\n"
-            "  • 파랑: 패턴 0 배치 확률\n"
-            "  • 초록: 패턴 1 배치 확률\n"
-            "  • 보라(A|B): 양쪽 다 가능"
+            "  • 파랑: 현재 패턴 배치 확률\n"
+            "  • 초록: 저장된 패턴 배치 확률\n"
+            "  • 보라: 위쪽은 현재 패턴, 아래쪽은 저장된 패턴 배치 확률"
         )
         info_label.setStyleSheet("color: gray; font-size: 11px;")
         info_label.setWordWrap(True)
@@ -957,7 +1006,7 @@ class BingoGUI(QMainWindow):
         
         right_layout.addStretch()
         
-        # Connect board click
+        # Connect board events
         self.board_widget.cellClicked.connect(self._on_cell_clicked)
         self.board_widget.cellDoubleClicked.connect(self._on_cell_double_clicked)
         
@@ -975,7 +1024,8 @@ class BingoGUI(QMainWindow):
     
     def _update_pattern_visibility(self):
         num_patterns = self.model_manager.current_num_patterns or 1
-        self.pattern_display_1.setVisible(num_patterns >= 2)
+        show_stored = num_patterns >= 2
+        self.pattern_1_container_widget.setVisible(show_stored)
     
     def _on_switch_model(self):
         current = self.model_manager.current_num_patterns
@@ -1007,23 +1057,27 @@ class BingoGUI(QMainWindow):
         pattern_idx = item.data(Qt.ItemDataRole.UserRole)
         num_patterns = self.model_manager.current_num_patterns or 1
         
-        # Find empty slot or replace first slot
+        # Add pattern to slots
         new_patterns = self.state.pattern_indices.copy()
         
         if num_patterns == 1:
             new_patterns[0] = pattern_idx
         else:
-            # For 2-pattern mode: fill empty slots first, then cycle
+            # For 2-pattern mode: new pattern becomes current (0), old current moves to stored (1)
             if new_patterns[0] < 0:
+                # First pattern selection
                 new_patterns[0] = pattern_idx
-            elif new_patterns[1] < 0:
-                new_patterns[1] = pattern_idx
             else:
-                # Both filled - replace the first one
+                # Push current to stored, new becomes current
+                new_patterns[1] = new_patterns[0]
                 new_patterns[0] = pattern_idx
         
         self.state.set_patterns(new_patterns)
         self._update_display()
+    
+    def _on_right_click(self, pos):
+        """Handle right-click on board - auto-place at optimal position."""
+        self._on_auto_place()
     
     def _on_cell_clicked(self, row, col):
         """Handle board cell click - show which action this would be."""
@@ -1052,6 +1106,15 @@ class BingoGUI(QMainWindow):
             self._update_display()
             self._check_game_complete()
     
+    def _on_swap_patterns(self):
+        """Swap current and stored patterns."""
+        if self.model_manager.current_num_patterns < 2:
+            return
+            
+        current = self.state.pattern_indices
+        self.state.pattern_indices = [current[1], current[0]]
+        self._update_display()
+
     def _on_auto_place(self):
         """Auto-place using model recommendation."""
         if self.current_probs is None:
@@ -1112,27 +1175,80 @@ class BingoGUI(QMainWindow):
         # Compute probabilities if we have patterns
         probs = None
         action_mask = None
+        merged_probs = False  # Flag for same-pattern merge
         
-        has_valid_pattern = any(p >= 0 for p in self.state.pattern_indices)
+        # For 2-pattern mode, require both patterns before computing
+        if num_patterns >= 2:
+            patterns_ready = all(p >= 0 for p in self.state.pattern_indices[:2])
+            if not patterns_ready and self.state.current_step == 0:
+                self.status_label.setText("패턴 2개를 선택해주세요")
+                self.current_probs = None
+                self.swap_btn.setEnabled(False)
+            elif not patterns_ready:
+                self.status_label.setText("")
+                self.current_probs = None
+                self.swap_btn.setEnabled(False)
+            else:
+                self.status_label.setText("")
+        else:
+            patterns_ready = self.state.pattern_indices[0] >= 0
+            self.status_label.setText("")
+            self.swap_btn.setEnabled(False)
         
-        if has_valid_pattern:
+        if patterns_ready:
             action_mask = self.state.get_action_mask()
-            probs = self.model_manager.get_d4_averaged_probs(
+            
+            # Sort patterns for inference (canonical state)
+            # The model was trained with sorted patterns (valid ones sorted, then -1s)
+            gui_indices = self.state.pattern_indices
+            valid_indices = [p for p in gui_indices if p >= 0]
+            invalid_indices = [p for p in gui_indices if p < 0]
+            sorted_indices = sorted(valid_indices) + invalid_indices
+            
+            # Get probabilities using sorted indices
+            raw_probs = self.model_manager.get_d4_averaged_probs(
                 self.state.board,
-                self.state.pattern_indices,
+                sorted_indices,
                 action_mask=action_mask,
             )
+            
+            # Remap probabilities back to GUI slot order
+            probs = np.zeros_like(raw_probs)
+            used_sorted_slots = [False] * num_patterns
+            
+            for gui_slot, gui_pattern in enumerate(gui_indices):
+                if gui_pattern < 0:
+                    continue
+                
+                # Find corresponding slot in sorted_indices
+                found_sorted_slot = -1
+                for s_slot, s_pattern in enumerate(sorted_indices):
+                    if s_pattern == gui_pattern and not used_sorted_slots[s_slot]:
+                        found_sorted_slot = s_slot
+                        used_sorted_slots[s_slot] = True
+                        break
+                
+                if found_sorted_slot != -1:
+                    probs[gui_slot*49 : (gui_slot+1)*49] = raw_probs[found_sorted_slot*49 : (found_sorted_slot+1)*49]
+            
+            # Same-pattern merge: if both patterns are the same, sum probabilities
+            if num_patterns >= 2 and self.state.pattern_indices[0] == self.state.pattern_indices[1]:
+                # Merge: sum of both slots, display as current pattern (slot 0)
+                merged = probs[:49] + probs[49:98]
+                probs = np.concatenate([merged, np.zeros(49)])  # slot 1 becomes zeros
+                merged_probs = True
+            
             self.current_probs = probs
-            self.auto_place_btn.setEnabled(action_mask.any())
+            self.swap_btn.setEnabled(num_patterns >= 2)
         else:
             self.current_probs = None
-            self.auto_place_btn.setEnabled(False)
+            self.swap_btn.setEnabled(False)
         
         self.board_widget.update_display(
             self.state.board,
             probs=probs,
             action_mask=action_mask,
-            num_patterns=num_patterns,
+            num_patterns=1 if merged_probs else num_patterns,  # Show as single pattern if merged
             threshold=0.10,
         )
         
