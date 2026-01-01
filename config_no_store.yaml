@@ -1,4 +1,4 @@
-# Bingo RL Training Configuration
+# Bingo RL Training Configuration (1 pattern mode)
 
 # Environment settings
 env:
@@ -6,7 +6,7 @@ env:
   num_envs: 32768  # 32K envs for maximum GPU utilization
   use_augmentation: true
   use_gpu_env: true  # Use GPU-accelerated vectorized environment
-  allow_store: false  # Set to false to disable pattern storage
+  num_patterns: 1  # 1 pattern = simple mode (replaces allow_store: false)
 
 # PPO hyperparameters
 # Rollout buffer: 32768 * 32 = 1,048,576 samples
@@ -29,7 +29,7 @@ policy:
   hidden_channels: 64
   num_res_blocks: 3
   kernel_size: 3
-  scalar_embed_dim: 32
+  pattern_embed_dim: 32  # Embedding dim for pattern indices
   features_dim: 256
   pi_layers: [256, 128]
   vf_layers: [256, 128]
@@ -47,8 +47,8 @@ curriculum:
 training:
   total_timesteps: 200_000_000  # 200M for full convergence
   device: "cuda"
-  save_path: "model/best_model_no_store"
-  final_model_path: "model/last_model_no_store"
+  save_path: "model/best_model_1pattern"
+  final_model_path: "model/last_model_1pattern"
 
 # Evaluation settings
 eval:
@@ -61,4 +61,4 @@ wandb:
   enabled: true
   project: "Trickcal-Bingo"
   entity: "voider-private"
-  name: "Trickcal-Bingo-GPU-v2_no_store"
+  name: "Trickcal-Bingo-1pattern"

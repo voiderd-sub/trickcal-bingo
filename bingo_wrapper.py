@@ -3,6 +3,8 @@ SB3-Compatible VecEnv Wrapper for GPU-Accelerated Bingo Environment.
 
 Wraps BingoEnvGPU to provide stable-baselines3 VecEnv interface.
 Handles GPU tensor to numpy conversion for SB3 compatibility.
+
+REFACTORED: Uses num_patterns instead of allow_store.
 """
 
 import torch
@@ -27,14 +29,18 @@ class BingoVecEnvGPU(VecEnv):
         num_envs: int,
         device: str = 'cuda',
         use_augmentation: bool = True,
+        num_patterns: int = 1,
     ):
         self.gpu_env = BingoEnvGPU(
             num_envs=num_envs,
             device=device,
             use_augmentation=use_augmentation,
+            num_patterns=num_patterns,
         )
         self.device = torch.device(device)
         self._num_envs = num_envs
+        self.num_patterns = num_patterns
+        self.n_actions = 49 * num_patterns
         
         # Pending actions for step_async/step_wait pattern
         self._actions: Optional[torch.Tensor] = None
@@ -42,14 +48,11 @@ class BingoVecEnvGPU(VecEnv):
         # Define observation and action spaces
         observation_space = spaces.Dict({
             "board": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
-            "pattern": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
-            "stored_pattern": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
-            "has_stored": spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
-            "cost": spaces.Box(low=0.0, high=10.0, shape=(), dtype=np.float32),
-            "action_mask": spaces.Box(0, 1, shape=(50,), dtype=np.uint8),
+            "pattern_indices": spaces.Box(low=-1, high=4, shape=(num_patterns,), dtype=np.int64),
+            "action_mask": spaces.Box(0, 1, shape=(self.n_actions,), dtype=np.uint8),
         })
         
-        action_space = spaces.Discrete(50)  # 49 positions + 1 store
+        action_space = spaces.Discrete(self.n_actions)
         
         super().__init__(num_envs, observation_space, action_space)
     
@@ -81,11 +84,6 @@ class BingoVecEnvGPU(VecEnv):
         
         # Create infos list (SB3 expects list of dicts)
         infos = [{} for _ in range(self.num_envs)]
-        
-        # Handle terminal observations (for VecEnv reset behavior)
-        # Note: BingoEnvGPU already auto-resets, so terminal_observation is the NEW obs
-        # We need to store the pre-reset observation for environments that terminated
-        # For now, we skip this as it's complex with auto-reset
         
         self._actions = None
         return obs, rewards, dones, infos
@@ -126,7 +124,6 @@ class BingoVecEnvGPU(VecEnv):
         Call method on environments.
         
         Special handling for SB3 compatibility.
-        Note: SB3 calls env_method("action_masks") and expects a list of numpy arrays.
         """
         if method_name == "set_curriculum":
             # set_curriculum(min_turns, max_turns)
@@ -136,10 +133,8 @@ class BingoVecEnvGPU(VecEnv):
         
         if method_name == "action_masks":
             # SB3 expects list of individual mask arrays, one per env
-            # Then it does np.stack() on them
             masks_gpu = self.gpu_env.action_masks()
-            masks_np = masks_gpu.cpu().numpy()  # (num_envs, 50)
-            # Return as list of arrays (one per env)
+            masks_np = masks_gpu.cpu().numpy()  # (num_envs, n_actions)
             return [masks_np[i] for i in range(self.num_envs)]
         
         if hasattr(self.gpu_env, method_name):
@@ -175,7 +170,7 @@ class BingoVecEnvGPU(VecEnv):
         Get action masks for all environments.
         
         Returns:
-            (num_envs, 50) boolean numpy array
+            (num_envs, n_actions) boolean numpy array
         """
         masks_gpu = self.gpu_env.action_masks()
         return masks_gpu.cpu().numpy().astype(bool)
@@ -218,60 +213,54 @@ if __name__ == "__main__":
     
     print("=== BingoVecEnvGPU Test ===")
     
-    # Test SB3 compatibility
+    # Test SB3 compatibility with num_patterns=1
+    print("\n--- Testing num_patterns=1 ---")
     num_envs = 256
-    env = BingoVecEnvGPU(num_envs=num_envs, device='cuda', use_augmentation=True)
+    env1 = BingoVecEnvGPU(num_envs=num_envs, device='cuda', use_augmentation=True, num_patterns=1)
     
-    print(f"Created VecEnv with {num_envs} environments")
-    print(f"Observation space: {env.observation_space}")
-    print(f"Action space: {env.action_space}")
+    print(f"Created VecEnv with {num_envs} environments (1 pattern)")
+    print(f"Observation space: {env1.observation_space}")
+    print(f"Action space: {env1.action_space}")
     
-    # Test reset
-    obs = env.reset()
-    print(f"\nReset successful!")
-    print(f"  board shape: {obs['board'].shape}, dtype: {obs['board'].dtype}")
-    print(f"  action_mask shape: {obs['action_mask'].shape}")
+    obs = env1.reset()
+    print(f"  action_mask shape: {obs['action_mask'].shape}")  # (num_envs, 49)
     
-    # Test step
-    masks = env.action_masks()
-    print(f"  action_masks shape: {masks.shape}, dtype: {masks.dtype}")
+    # Test with num_patterns=2
+    print("\n--- Testing num_patterns=2 ---")
+    env2 = BingoVecEnvGPU(num_envs=num_envs, device='cuda', use_augmentation=True, num_patterns=2)
     
-    # Sample valid actions
-    actions = np.array([
-        np.random.choice(np.where(m)[0]) for m in masks
-    ])
+    print(f"Action space: {env2.action_space}")
+    obs = env2.reset()
+    print(f"  action_mask shape: {obs['action_mask'].shape}")  # (num_envs, 98)
     
-    env.step_async(actions)
-    obs, rewards, dones, infos = env.step_wait()
+    masks = env2.action_masks()
+    actions = np.array([np.random.choice(np.where(m)[0]) for m in masks])
     
-    print(f"\nStep successful!")
+    env2.step_async(actions)
+    obs, rewards, dones, infos = env2.step_wait()
+    
+    print(f"Step successful!")
     print(f"  rewards: min={rewards.min():.2f}, max={rewards.max():.2f}")
-    print(f"  dones: {dones.sum()} environments done")
     
     # Benchmark
-    print("\nBenchmarking...")
-    env.reset()
+    print("\nBenchmarking num_patterns=2...")
+    env2.reset()
     
     start = time.time()
     n_iters = 1000
     
     for _ in range(n_iters):
-        masks = env.action_masks()
+        masks = env2.action_masks()
         actions = np.array([np.random.choice(np.where(m)[0]) for m in masks])
-        env.step_async(actions)
-        obs, rewards, dones, infos = env.step_wait()
+        env2.step_async(actions)
+        obs, rewards, dones, infos = env2.step_wait()
     
     elapsed = time.time() - start
     fps = (n_iters * num_envs) / elapsed
     
     print(f"FPS: {fps:,.0f}")
-    print(f"Note: numpy action sampling is slow. Real training uses policy network.")
+    print("Note: numpy action sampling is slow. Real training uses policy network.")
     
-    # Test curriculum
-    print("\nTesting curriculum...")
-    env.env_method("set_curriculum", 5, 10)
-    obs = env.reset()
-    print("Curriculum set to (5, 10) - boards should be partially filled")
-    
-    env.close()
+    env1.close()
+    env2.close()
     print("\nAll tests passed!")

@@ -3,6 +3,8 @@ Custom GPU-Native PPO Training for Bingo.
 
 Stays entirely on GPU - no CPU/GPU transfer overhead.
 Implements MaskablePPO with all operations on CUDA tensors.
+
+REFACTORED: Uses num_patterns (1 or 2) instead of allow_store.
 """
 
 import torch
@@ -36,12 +38,13 @@ class MaskablePPOPolicy(nn.Module):
     def __init__(
         self,
         observation_space,
-        action_dim: int = 50,
+        action_dim: int = 49,
         features_dim: int = 256,
         hidden_channels: int = 64,
         num_res_blocks: int = 3,
         kernel_size: int = 3,
-        scalar_embed_dim: int = 32,
+        pattern_embed_dim: int = 32,
+        num_patterns: int = 1,
         pi_layers: list = [256, 128],
         vf_layers: list = [256, 128],
     ):
@@ -54,8 +57,10 @@ class MaskablePPOPolicy(nn.Module):
             hidden_channels=hidden_channels,
             num_res_blocks=num_res_blocks,
             kernel_size=kernel_size,
-            scalar_embed_dim=scalar_embed_dim,
+            pattern_embed_dim=pattern_embed_dim,
+            num_patterns=num_patterns,
         )
+
         
         # Policy head
         pi_layers_list = []
@@ -116,7 +121,7 @@ class MaskablePPOPolicy(nn.Module):
         
         Args:
             obs: Observation dict
-            action_mask: (batch, 50) boolean mask of valid actions
+            action_mask: (batch, n_actions) boolean mask of valid actions
             action: Optional action to evaluate (for training)
             deterministic: If True, return argmax action
         
@@ -158,10 +163,12 @@ class RolloutBuffer:
         num_envs: int,
         n_steps: int,
         obs_shapes: Dict[str, tuple],
+        n_actions: int,
         device: str = 'cuda',
     ):
         self.num_envs = num_envs
         self.n_steps = n_steps
+        self.n_actions = n_actions
         self.device = torch.device(device)
         self.ptr = 0
         self.full = False
@@ -172,7 +179,7 @@ class RolloutBuffer:
             for key, shape in obs_shapes.items()
         }
         self.actions = torch.zeros((n_steps, num_envs), dtype=torch.int64, device=self.device)
-        self.action_masks = torch.zeros((n_steps, num_envs, 50), dtype=torch.bool, device=self.device)
+        self.action_masks = torch.zeros((n_steps, num_envs, n_actions), dtype=torch.bool, device=self.device)
         self.rewards = torch.zeros((n_steps, num_envs), device=self.device)
         self.dones = torch.zeros((n_steps, num_envs), dtype=torch.bool, device=self.device)
         self.values = torch.zeros((n_steps, num_envs), device=self.device)
@@ -193,7 +200,7 @@ class RolloutBuffer:
         log_prob: torch.Tensor,
     ):
         """Add a transition to the buffer."""
-        # Only store obs keys that exist in buffer (skip 'cost', 'action_mask')
+        # Only store obs keys that exist in buffer (skip 'action_mask')
         for key in self.obs.keys():
             if key in obs:
                 self.obs[key][self.ptr] = obs[key]
@@ -246,7 +253,7 @@ class RolloutBuffer:
             for key, val in self.obs.items()
         }
         flat_actions = self.actions.view(total_samples)
-        flat_masks = self.action_masks.view(total_samples, 50)
+        flat_masks = self.action_masks.view(total_samples, self.n_actions)
         flat_log_probs = self.log_probs.view(total_samples)
         flat_advantages = self.advantages.view(total_samples)
         flat_returns = self.returns.view(total_samples)
@@ -299,36 +306,40 @@ class PPOTrainer:
         self.vf_coef = ppo_cfg['vf_coef']
         self.max_grad_norm = ppo_cfg['max_grad_norm']
         self.total_timesteps = train_cfg['total_timesteps']
-        self.allow_store = env_cfg.get('allow_store', True)
+        self.num_patterns = env_cfg.get('num_patterns', 1)
+        
+        # Action dimension based on num_patterns
+        self.n_actions = 49 * self.num_patterns
         
         # Create environment
         print(f"Creating GPU environment with {self.num_envs} envs...")
-        print(f"  allow_store: {self.allow_store}")
+        print(f"  num_patterns: {self.num_patterns}")
+        print(f"  action_dim: {self.n_actions}")
         self.env = BingoEnvGPU(
             num_envs=self.num_envs,
             device=str(self.device),
             use_augmentation=env_cfg['use_augmentation'],
-            allow_store=self.allow_store,
+            num_patterns=self.num_patterns,
         )
         
         # Create observation space for policy
         from gymnasium import spaces
         obs_space = spaces.Dict({
             "board": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
-            "pattern": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
-            "stored_pattern": spaces.Box(low=0, high=1, shape=(7, 7), dtype=np.int8),
-            "has_stored": spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
+            "pattern_indices": spaces.Box(low=-1, high=4, shape=(self.num_patterns,), dtype=np.int64),
         })
         
         # Create policy
         print("Creating policy...")
         self.policy = MaskablePPOPolicy(
             obs_space,
+            action_dim=self.n_actions,
             features_dim=policy_cfg['features_dim'],
             hidden_channels=policy_cfg['hidden_channels'],
             num_res_blocks=policy_cfg['num_res_blocks'],
             kernel_size=policy_cfg['kernel_size'],
-            scalar_embed_dim=policy_cfg['scalar_embed_dim'],
+            pattern_embed_dim=policy_cfg.get('pattern_embed_dim', 32),
+            num_patterns=self.num_patterns,
             pi_layers=policy_cfg['pi_layers'],
             vf_layers=policy_cfg['vf_layers'],
         ).to(self.device)
@@ -345,14 +356,13 @@ class PPOTrainer:
         # Rollout buffer
         obs_shapes = {
             'board': (7, 7),
-            'pattern': (7, 7),
-            'stored_pattern': (7, 7),
-            'has_stored': (1,),
+            'pattern_indices': (self.num_patterns,),
         }
         self.buffer = RolloutBuffer(
             self.num_envs,
             self.n_steps,
             obs_shapes,
+            n_actions=self.n_actions,
             device=str(self.device),
         )
         
@@ -394,9 +404,7 @@ class PPOTrainer:
         """Prepare observation for policy (convert to float, exclude action_mask)."""
         return {
             'board': obs['board'].float(),
-            'pattern': obs['pattern'].float(),
-            'stored_pattern': obs['stored_pattern'].float(),
-            'has_stored': obs['has_stored'],
+            'pattern_indices': obs['pattern_indices'].long(),
         }
     
     def _update_curriculum(self, timestep: int):
@@ -431,21 +439,19 @@ class PPOTrainer:
     def _evaluate(self) -> tuple:
         """
         Evaluate policy without augmentation.
-        Returns (mean_actions, std_actions, mean_stores).
+        Returns (mean_actions, std_actions).
         """
-        # Create eval environment (no augmentation, same allow_store setting)
+        # Create eval environment (no augmentation, same num_patterns setting)
         eval_env = BingoEnvGPU(
             num_envs=self.eval_num_envs,
             device=str(self.device),
             use_augmentation=False,  # No augmentation for eval
-            allow_store=self.allow_store,  # Same as training
+            num_patterns=self.num_patterns,
         )
         eval_env.reset()
         
         episode_action_counts = []
-        episode_store_counts = []
         action_counts = torch.zeros(self.eval_num_envs, dtype=torch.int32, device=self.device)
-        store_counts = torch.zeros(self.eval_num_envs, dtype=torch.int32, device=self.device)
         
         # Run until enough episodes
         while len(episode_action_counts) < self.eval_num_episodes:
@@ -458,11 +464,8 @@ class PPOTrainer:
                     obs_float, action_mask, deterministic=True
                 )
             
-            # Count position actions (not store=49) and store actions
-            is_position = action < 49
-            is_store = action == 49
-            action_counts += is_position.int()
-            store_counts += is_store.int()
+            # Count all actions (each is a pattern placement)
+            action_counts += 1
             
             _, _, done, _, _ = eval_env.step(action)
             
@@ -470,17 +473,14 @@ class PPOTrainer:
             if done.any():
                 for i in done.nonzero(as_tuple=True)[0]:
                     episode_action_counts.append(action_counts[i].item())
-                    episode_store_counts.append(store_counts[i].item())
                     action_counts[i] = 0
-                    store_counts[i] = 0
         
         del eval_env
         torch.cuda.empty_cache()
         
         actions = episode_action_counts[:self.eval_num_episodes]
-        stores = episode_store_counts[:self.eval_num_episodes]
         
-        return np.mean(actions), np.std(actions), np.mean(stores)
+        return np.mean(actions), np.std(actions)
     
     def collect_rollouts(self):
         """Collect rollouts using current policy."""
@@ -603,6 +603,7 @@ class PPOTrainer:
         print(f"  N steps: {self.n_steps}")
         print(f"  Batch size: {self.batch_size}")
         print(f"  Total timesteps: {self.total_timesteps}")
+        print(f"  Num patterns: {self.num_patterns}")
         print("="*60)
         
         timestep = 0
@@ -632,9 +633,6 @@ class PPOTrainer:
             self.buffer.reset()
             n_updates += 1
             
-            # LR decay removed
-
-            
             # Logging
             elapsed = time.time() - start_time
             fps = timestep / elapsed
@@ -654,7 +652,7 @@ class PPOTrainer:
                       f"clip: {train_info['clip_fraction']:.3f}",
                       flush=True)
             
-            # Log to wandb every update (unified naming with train.py)
+            # Log to wandb every update
             if self.use_wandb:
                 wandb.log({
                     'rollout/ep_rew_mean': ep_rew,
@@ -675,15 +673,14 @@ class PPOTrainer:
             # Evaluation
             if timestep - self.last_eval_timestep >= self.eval_freq:
                 self.last_eval_timestep = timestep
-                mean_actions, std_actions, mean_stores = self._evaluate()
+                mean_actions, std_actions = self._evaluate()
                 
-                print(f"[EVAL] mean_actions: {mean_actions:.2f} ± {std_actions:.2f}, mean_stores: {mean_stores:.2f} (best: {self.best_mean_actions:.2f})", flush=True)
+                print(f"[EVAL] mean_actions: {mean_actions:.2f} ± {std_actions:.2f} (best: {self.best_mean_actions:.2f})", flush=True)
                 
                 if self.use_wandb:
                     wandb.log({
                         'eval/mean_actions': mean_actions,
                         'eval/std_actions': std_actions,
-                        'eval/mean_stores': mean_stores,
                         'eval/best_mean_actions': min(self.best_mean_actions, mean_actions),
                     })
                 
