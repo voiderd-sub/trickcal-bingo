@@ -14,9 +14,9 @@ BASE_PATH = Path(SPECPATH)
 
 # Data files to include
 datas = [
-    # Model files (required for inference)
-    (str(BASE_PATH / 'model' / 'best_model.pt'), 'model'),
-    (str(BASE_PATH / 'model' / 'best_model_no_store.pt'), 'model'),
+# Model files (required for inference)
+    (str(BASE_PATH / 'model' / 'best_model_2patterns.pt'), 'model'),
+    (str(BASE_PATH / 'model' / 'best_model_1pattern.pt'), 'model'),
 ]
 
 # Hidden imports that PyInstaller might miss

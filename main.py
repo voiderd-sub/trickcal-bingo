@@ -99,19 +99,6 @@ def transform_board(board: np.ndarray, transform_idx: int) -> np.ndarray:
     return transformed.reshape(7, 7)
 
 
-def inverse_transform_probs(probs: np.ndarray, transform_idx: int, num_patterns: int) -> np.ndarray:
-    """Inverse transform position probabilities back to original coordinate system."""
-    n_actions = 49 * num_patterns
-    result = np.zeros(n_actions)
-    
-    for slot in range(num_patterns):
-        start_idx = slot * 49
-        pos_probs = probs[start_idx:start_idx + 49]
-        forward_mapping = D4_FORWARD_POS[transform_idx]
-        result[start_idx:start_idx + 49] = pos_probs[forward_mapping]
-    
-    return result
-
 
 def compute_dynamic_orbits(board: np.ndarray, pattern_idx: int = None) -> list:
     """
@@ -176,15 +163,23 @@ def compute_dynamic_orbits(board: np.ndarray, pattern_idx: int = None) -> list:
     return list(canonical_to_positions.values())
 
 
-def normalize_probs_by_dynamic_orbit(probs: np.ndarray, board: np.ndarray, pattern_idx: int, num_patterns: int) -> np.ndarray:
+def normalize_probs_by_dynamic_orbit(probs: np.ndarray, board: np.ndarray, pattern_indices: list, num_patterns: int) -> np.ndarray:
     """
     Normalize probabilities so that symmetric positions have the same probability.
+    
+    Each slot uses its own pattern's orbit - positions that produce D4-equivalent
+    result boards when that pattern is placed.
     """
     normalized = probs.copy()
-    orbits = compute_dynamic_orbits(board, pattern_idx)
     
     for slot in range(num_patterns):
+        pattern_idx = pattern_indices[slot] if slot < len(pattern_indices) else -1
+        if pattern_idx < 0:
+            continue
+            
+        orbits = compute_dynamic_orbits(board, pattern_idx)
         start_idx = slot * 49
+        
         for orbit in orbits:
             orbit_sum = sum(probs[start_idx + pos] for pos in orbit)
             for pos in orbit:
@@ -496,22 +491,26 @@ class ModelManager:
             return True
         return False
     
-    def get_d4_averaged_probs(
+    def get_probs_with_orbit_normalization(
         self,
         board: np.ndarray,
         pattern_indices: list,
         action_mask: np.ndarray = None,
     ) -> np.ndarray:
         """
-        Compute D4 symmetry-averaged action probabilities.
+        Compute action probabilities with D4 orbit normalization.
+        
+        1. Single model inference
+        2. For each pattern slot, compute orbits based on result board D4 equivalence
+        3. Positions in the same orbit (producing D4-equivalent result boards) get summed probability
         
         Args:
             board: Current board state (7x7)
-            pattern_indices: List of pattern indices
+            pattern_indices: List of pattern indices [current, stored]
             action_mask: Valid action mask (n_actions,)
         
         Returns:
-            (n_actions,) array of averaged probabilities
+            (n_actions,) array of orbit-normalized probabilities
         """
         if self.policy is None:
             return np.zeros(self.current_num_patterns * 49)
@@ -522,60 +521,34 @@ class ModelManager:
         if action_mask is None:
             action_mask = np.ones(n_actions, dtype=bool)
         
-        all_probs = []
-        
         # Get padded pattern observations
         pattern_0_obs = self._get_pattern_obs(pattern_indices[0] if len(pattern_indices) > 0 else -1)
         pattern_1_obs = self._get_pattern_obs(pattern_indices[1] if len(pattern_indices) > 1 else -1)
         
-        for transform_idx in range(8):
-            # Transform observations
-            transformed_board = transform_board(board, transform_idx)
-            transformed_pattern_0 = transform_board(pattern_0_obs, transform_idx)
-            transformed_pattern_1 = transform_board(pattern_1_obs, transform_idx)
-            
-            # Transform action mask
-            transformed_mask = np.zeros(n_actions, dtype=bool)
-            for slot in range(num_patterns):
-                start_idx = slot * 49
-                for orig_pos in range(49):
-                    new_pos = D4_FORWARD_POS[transform_idx, orig_pos]
-                    transformed_mask[start_idx + new_pos] = action_mask[start_idx + orig_pos]
-            
-            # Create observation tensors
-            obs = {
-                'board': torch.from_numpy(transformed_board).float().unsqueeze(0),
-                'pattern_0': torch.from_numpy(transformed_pattern_0).float().unsqueeze(0),
-                'pattern_1': torch.from_numpy(transformed_pattern_1).float().unsqueeze(0),
-            }
-            
-            # Get logits
-            with torch.no_grad():
-                logits, _ = self.policy(obs)
-            
-            # Apply action mask
-            logits = logits.squeeze(0).clone()
-            mask_tensor = torch.from_numpy(transformed_mask)
-            logits[~mask_tensor] = float('-inf')
-            
-            # Compute probabilities
-            probs = F.softmax(logits, dim=-1).numpy()
-            
-            # Inverse transform
-            original_probs = inverse_transform_probs(probs, transform_idx, num_patterns)
-            
-            all_probs.append(original_probs)
+        # Create observation tensors
+        obs = {
+            'board': torch.from_numpy(board).float().unsqueeze(0),
+            'pattern_0': torch.from_numpy(pattern_0_obs).float().unsqueeze(0),
+            'pattern_1': torch.from_numpy(pattern_1_obs).float().unsqueeze(0),
+        }
         
-        # Average across all 8 transforms
-        averaged_probs = np.mean(all_probs, axis=0)
+        # Single model inference
+        with torch.no_grad():
+            logits, _ = self.policy(obs)
         
-        # Normalize by orbit for pattern 0 (main pattern)
-        if len(pattern_indices) > 0 and pattern_indices[0] >= 0:
-            normalized_probs = normalize_probs_by_dynamic_orbit(
-                averaged_probs, board, pattern_indices[0], num_patterns
-            )
-        else:
-            normalized_probs = averaged_probs
+        # Apply action mask
+        logits = logits.squeeze(0).clone()
+        mask_tensor = torch.from_numpy(action_mask)
+        logits[~mask_tensor] = float('-inf')
+        
+        # Compute probabilities
+        probs = F.softmax(logits, dim=-1).numpy()
+        
+        # Normalize by orbit for each pattern slot
+        # Positions producing D4-equivalent result boards share their probability sum
+        normalized_probs = normalize_probs_by_dynamic_orbit(
+            probs, board, pattern_indices, num_patterns
+        )
         
         return normalized_probs
     
@@ -1205,11 +1178,31 @@ class BingoGUI(QMainWindow):
             invalid_indices = [p for p in gui_indices if p < 0]
             sorted_indices = sorted(valid_indices) + invalid_indices
             
-            # Get probabilities using sorted indices
-            raw_probs = self.model_manager.get_d4_averaged_probs(
+            # Reorder action_mask to match sorted_indices
+            sorted_mask = np.zeros_like(action_mask)
+            used_sorted_mask_slots = [False] * num_patterns
+            
+            for gui_slot, gui_pattern in enumerate(gui_indices):
+                if gui_pattern < 0:
+                    continue
+                
+                # Find corresponding slot in sorted_indices for mapping mask
+                found_sorted_slot = -1
+                for s_slot, s_pattern in enumerate(sorted_indices):
+                    if s_pattern == gui_pattern and not used_sorted_mask_slots[s_slot]:
+                        found_sorted_slot = s_slot
+                        used_sorted_mask_slots[s_slot] = True
+                        break
+                
+                if found_sorted_slot != -1:
+                    sorted_mask[found_sorted_slot*49 : (found_sorted_slot+1)*49] = \
+                        action_mask[gui_slot*49 : (gui_slot+1)*49]
+            
+            # Get probabilities using sorted indices and sorted mask
+            raw_probs = self.model_manager.get_probs_with_orbit_normalization(
                 self.state.board,
                 sorted_indices,
-                action_mask=action_mask,
+                action_mask=sorted_mask,
             )
             
             # Remap probabilities back to GUI slot order
